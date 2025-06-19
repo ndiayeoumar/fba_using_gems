@@ -1,0 +1,916 @@
+---
+title: "Compass data analysis - metareaction comparisons"
+subtitle: "An example of metabolic profiles anlysis of CD8 cells in Alzheimer"
+author: 
+    - Oumar Ndiaye
+    - Matteo Calgaro
+date: "`r Sys.Date()`"
+output: 
+    bookdown::html_document2:
+        code_folding: hide
+        toc: yes
+        toc_float: true
+        number_section: yes
+        fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+# Introduction
+
+In this example, we use the single-cell data from the Alzheimer's Disease mice, brain and meningeal tissues, we focus on the CD8 cells. This time we use the metareactions to explore the metabolic profile of the cells instead of using the reactions.
+
+## Loading some libraries
+
+The modified `compassR` version is in [this repository](https://github.com/mcalgaro93/compassR). To install it the following command can be run:
+
+```{r, eval=FALSE}
+devtools::install_github("mcalgaro93/compassR")
+```
+
+Then, we load some packages for data manipulation and visualization.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE}
+library(compassR)
+# To manipulate data
+library(dplyr)
+library(plyr)
+# To plot/visualize data
+library(ggplot2)
+library(ggalluvial)
+library(plotly)
+library(cowplot)
+library(DT)
+library(forcats)
+library(tidytext)
+```
+
+## Loading data
+
+To perform COMPASS post-processing some settings must be chosen. By setting the class object `compassSettings`, it is possible to define:
+
+-   the metabolic model directory;
+
+-   the genes, metabolites, reactions, and cells metadata;
+
+-   the user data directory;
+
+-   the COMPASS's output with the reaction penalties;
+
+-   the gene expression input matrix;
+
+-   column names for cells and genes;
+
+-   some naming option for the direction of reactions;
+
+-   the minimum range of variation for a reaction to be kept (not variable reactions are removed);
+
+-   the cut height for the hierarchical clustering used to define meta-reactions
+
+```{r}
+user_data_directory <- "../../data/alzheimer/cd8/tpm_counts_normalized"
+settings <- CompassSettings$new(
+    metabolic_model_directory = system.file("extdata", 
+        "RECON2", package = "compassR"),
+    gene_metadata_file = "gene_metadata.csv",
+    metabolite_metadata_file = "metabolite_metadata.csv",
+    reaction_metadata_file = "reaction_metadata.csv",
+    user_data_directory = user_data_directory,
+    cell_metadata_file = "cell_metadata.csv",
+    compass_reaction_scores_file = "reactions.tsv",
+    linear_gene_expression_matrix_file = "linear_gene_expression_matrix.tsv",
+    cell_id_col_name = "cell_id",
+    gene_id_col_name = "MGI.symbol",
+    reaction_direction_separator = "_",
+    reaction_directions = c("pos", "neg"),
+    min_reaction_consistency = 1e-04, # Not used
+    min_reaction_range = 1e-03,
+    cluster_strength = 0.02 # Spearman correlation 0.98
+)
+```
+
+To run the COMPASS post-processing the `CompassData` object must be created. This procedure is quite time expensive. For this reason we create this object once and then we can load it.
+
+```{r}
+if(!file.exists("../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")){
+    compass_data <- CompassData$new(settings = settings)
+    saveRDS(compass_data, 
+        file = "../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")
+} else compass_data <- readRDS("../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")
+```
+
+The `compassData` object contains several informations:
+
+-   the reaction and meta-reaction consistencies;
+
+-   metabolic genes;
+
+-   genes, cells, reactions, and metabolites metadata
+
+```{r}
+compass_data
+
+# Replace 
+compass_data$gene_expression_statistics <- 
+    compass_data$gene_expression_statistics %>%
+        mutate(cell_id = gsub("[.]", "-", x = cell_id))
+```
+
+To proceed with the analysis, a `CompassAnalyzer` object is created. Two functions are natively available:
+
+-   `conduct_wilcoxon_test()` to conduct a wilcoxon test to compare reaction differential consistency between group of cells;
+
+-   `get_umap_components()` to ordinate the cells based on metabolic profiles.
+
+We added a new function which is `get_umap_components()` to compute PCA of consistencies matrix
+
+```{r}
+compass_analyzer <- CompassAnalyzer$new(settings)
+```
+
+# Data exploration
+
+We want to explore the reactions consistencies. But the data set is very large so we need to reduce the dimensionality of our data. We perform two different unsupervised dimensionality reduction methods: **Uniform Manifold Approximation and Projection (UMAP)** and **Principal Component Analysis (PCA)**.
+
+```{r}
+# As cell_id are numbers, they have been preceded by the 'X'
+# character. For this reason, we remove the character.
+# compass_data$gene_expression_statistics$cell_id <- 
+#     compass_data$gene_expression_statistics$cell_id %>% 
+#     gsub(pattern = "X", replacement = "")
+
+# We set a seed for UMAP reproducibility
+# https://bugs.r-project.org/show_bug.cgi?id=17494 explains why "Rejection"
+set.seed(123, "Mersenne-Twister", sample.kind = "Rejection")
+# get UMAP components
+umap_components <- compass_analyzer$get_umap_components(
+    compass_data$metareaction_consistencies)
+# get PCA components
+pca_components <- compass_analyzer$get_pca_components(
+    compass_data$metareaction_consistencies)
+components <- inner_join(
+    x = umap_components, 
+    y = pca_components,
+    by = "cell_id")
+
+# We perform the UMAP and we add metadata informations
+cell_info_with_dimensionality_reduction <-
+    components %>% 
+    mutate(cell_id = gsub(pattern = "[.]", replacement = "-", x = cell_id)) %>%
+    inner_join(
+        compass_data$cell_metadata,
+        by = "cell_id"
+    ) %>%
+    left_join(
+        compass_data$gene_expression_statistics,
+        by = "cell_id"
+    )
+```
+
+### UMAP 
+
+It is a non-linear dimensional reduction method which is very effective for visualizing clusters or groups of data points and their relative proximities.
+
+```{r message=FALSE, error=FALSE}
+# UMAP components are computed as characters. 
+# We convert them in numeric values
+cell_info_with_dimensionality_reduction$component_1 <- 
+    as.numeric(cell_info_with_dimensionality_reduction$component_1)
+cell_info_with_dimensionality_reduction$component_2 <- 
+    as.numeric(cell_info_with_dimensionality_reduction$component_2)
+```
+
+#### Tissue and Condition
+
+In Figure \@ref(fig:rumapbytissuecond) cells are clearly separated by tissue and condition. Each group contains cells of only one tissue and one condition. The first dimension separates tissues, the second, conditions.
+
+```{r rumapbytissuecond, fig.cap="Each dot represents a single cell coloured based on its tissue and condition."}
+p_m_umap_tissue_condition <- ggplot(cell_info_with_dimensionality_reduction, aes(x = component_1, 
+    y = component_2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.5, size = 1) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP colored by tissue (Brain or Meninges) and condition (3xTg or WT)") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    stat_ellipse(aes(lty = paste0(tissue, ", ", condition))) + 
+    guides(color = guide_legend(title = "Tissue and Condition"), 
+           lty = guide_legend(title = "Tissue and Condition"))
+
+p_m_umap_tissue_condition
+```
+
+#### Cell type
+
+In figure \@ref(fig:rumapbycelltype) we can't see groups of cells containing only cells from one single cell type. Thus, the first two UMAP dimensions seem not to separate cells based on the type they belong to.
+
+```{r rumapbycelltype, fig.cap="Each dot represents a single cell coloured based on the type they belong to."}
+p_m_umap_ct <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cell_type)) +
+    geom_point(alpha = 0.8, size = 1) +
+    ggtitle("UMAP colored by cell type") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) + 
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cell type", ncol = 2))
+
+p_m_umap_ct
+```
+
+#### Metabolic activity
+
+On the summary of our `compassData` object we have *gene_expression* table containing the columns `total_expression`, `metabolic_expression`, and `metabolic_activity`. A cell's "total expression" is the extent to which it expresses any of its genes. Its "metabolic expression" is the extent to which it expresses its metabolic genes. And finally, its "metabolic activity" is the ratio of its metabolic expression to its total expression. In Figure \@ref(fig:rumapbymetabolicactivity), cells within the same group present different metabolic activities. Therefore they don't seem to be segregated based on their metabolic activity levels. Also here we see a very narrow range of metabolic activity values, meaning that most of the genes these cells express do not belong to the genome-scale metabolic model RECON2.
+
+```{r rumapbymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_umap_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8, size = 1) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP colored by metabolic activity") +
+    xlab(label ="UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_umap_ma
+```
+
+### PCA
+
+It is accomplished by linearly transforming the data into a new coordinate system where (most of) the variation in the data can be described with fewer dimensions than the initial data. Many studies use the first two principal components in order to plot the data in two dimensions and to visually identify clusters of closely related data points.
+
+#### Tissue and Condition
+
+In Figure \@ref(fig:rpcabytissuecondition) groups of cells are clearly separated by tissue and condition. We can say that the first PC separate cells based on their tissue.
+
+```{r rpcabytissuecondition, fig.cap="Each dot represents a single cell coloured based on their tissue and condition."}
+p_m_pca_tissue_condition <- ggplot(cell_info_with_dimensionality_reduction, aes(x = PCA_1, 
+    y = PCA_2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA colored by tissue (Brain or Meninges) and condition (3xTg or WT)") +
+    xlab(label = "PC 1") +
+    ylab(label = "PC 2") +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Tissue and Condition"), 
+           lty = guide_legend(title = "Tissue and Condition"))
+
+p_m_pca_tissue_condition
+```
+
+#### Cell type
+
+In figure \@ref(fig:rpcabycelltype) we can't see group of cells containing only cells of one single type. Thus, the first two PCs don't seem to separate cells based on the type they belong to.
+
+```{r rpcabycelltype, fig.cap="Each dot represents a single cell coloured based on the subset they belong to."}
+p_m_pca_ct <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA colored by cell type") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) + 
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cell type", ncol = 3))
+
+p_m_pca_ct
+```
+
+#### Metabolic activity
+
+In Figure \@ref(fig:rpcabymetabolicactivity), cells within the same group present different metabolic activities. Therefore they don't seem to be segregated based on their metabolic activity levels.
+
+```{r rpcabymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_pca_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA colored by metabolic activity") +
+    xlab(label ="PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_pca_ma
+```
+
+# Cluster analysis
+
+Stage and condition differentiate our cells. A possible way to further disclose the cells' characteristics is to group them in clusters based on the first two dimensions of the UMAP plot. Then, we try to discover what are the characteristics of each cluster.
+
+Firstly, to automatically detect the number of clusters, we will use the function `get_optimal_clusters()` to identify the number of clusters which maximizes the silhouette index.
+
+```{r avgSilPlot, fig.cap="Average silhouette indexes for several number of clusters. The hierarchical clustering algorithm on 'euclidean' distances using the 'average' agglomeration method has been used."}
+opt_cl <- get_optimal_clusters(UMAPcoords = cell_info_with_dimensionality_reduction[, c("component_1", "component_2")], k.values = 5:25, plot = TRUE)
+```
+
+According to the average silhouette values in Figure \@ref(fig:avgSilPlot), the optimal number of clusters is 8. 
+
+To obtain the cluster membership for each cell, the `function get_cluster()` can be used. The number of cells in each cluster, stratified by cell type, tissue, and condition is summarized in Figure \@ref(fig:plotCellTypeCluster).
+
+```{r clMembership}
+cell_info_with_dimensionality_reduction$cluster <- as.factor(get_cluster(
+    df = cell_info_with_dimensionality_reduction[, c("component_1", "component_2")],
+    k = 8))
+# kableExtra::kable(
+#     x = table(cell_info_with_dimensionality_reduction$cluster), 
+#     caption = "Number of cells for each cluster.",
+#     col.names = c("Cluster", "N Cells"), booktabs = TRUE)
+```
+
+```{r plotCellTypeCluster, fig.cap="Cell types distribution across stages and clusters.", fig.height=8, fig.width=5}
+# Count how many cells for each cluster, stage, cell type
+df_cluster <- plyr::ddply(.data = cell_info_with_dimensionality_reduction, 
+    .variables = ~ cluster + tissue + condition + cell_type, 
+    function(cells) return(data.frame("n" = nrow(cells))))
+
+# Count how many cells for each cluster
+df_cluster_summary <- df_cluster %>% 
+    group_by(cluster) %>%
+    dplyr::summarize(n = sum(n)) %>%
+    arrange(desc(n))
+
+# Order the cluster levels for the summary
+df_cluster_summary$cluster <- factor(df_cluster_summary$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+# Order the cluster levels for the df
+df_cluster$cluster <- factor(df_cluster$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+
+# Generate table with the frequencies
+main_plot <- ggplot(data = df_cluster, 
+    aes(x = cluster, y = cell_type)) +
+    # coord_equal() + 
+    geom_tile(aes(fill = cell_type, alpha = n), width = 0.8, height = 0.8) +
+    geom_text(aes(label = n)) + 
+    ggh4x::facet_nested(tissue + condition ~ ., scales = "free", space = "free") +
+    scale_x_discrete(breaks = 1:8) +
+    ylab("Cell type") +
+    scale_fill_manual(guide = "none", values = RColorBrewer::brewer.pal(n = 5, "Set1")) +
+    scale_alpha_continuous(guide = "none")
+
+# Generate a barplot with the total cells in each clusters
+over_strip <- ggplot(data = df_cluster_summary, 
+    aes(x = cluster, y = n, fill = cluster)) +
+    geom_col(aes(alpha = n), width = 0.8) +
+    geom_text(aes(label = n, y = n + 5)) + 
+    scale_x_discrete(breaks = df_cluster_summary$cluster) +
+    scale_alpha_continuous(guide = "none") +
+    theme_void() +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(8, "Set3"), breaks = c(1:8)) +
+    theme(legend.position = "none")
+
+# Combine the two plots
+cowplot::plot_grid(over_strip, main_plot, ncol = 1, axis = "lr", align = "v", rel_heights = c(1,5))
+```
+
+The UMAP representation is visible in Figure \@ref(fig:rUMAPbycluster).
+
+```{r rUMAPbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_umap_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP colored by cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_umap_cluster
+```
+
+
+
+```{r rUMAPbyclustertissuecondition, fig.cap="Each dot represents a single cell coloured based on their cluster membership. Cells are faceted by tissue and condition."}
+p_m_umap_cluster + 
+    ggh4x::facet_nested_wrap(tissue ~ condition) + 
+    geom_hline(yintercept = 0, color = "grey") + 
+    geom_vline(xintercept = 0, color = "grey")
+```
+
+The PCA representation is visible in Figure \@ref(fig:rPCAbycluster).
+
+```{r rPCAbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_pca_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA colored by cluster") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_pca_cluster
+```
+
+# Summary
+
+Before moving on with deeper analysis of these clusters, it would be interesting to investigate the UMAP and PCA representations based on the gene expression values with the information about the cluster membership of the cells based on their metabolic profile. In case of systematic patterns, we shall assume that there might be a direct association between gene expression levels and their reactions.
+
+```{r}
+gene_exp_umap_comps <- read.csv(file = "../../data/alzheimer/cd8/PCA_UMAP_coordinates.csv")
+
+# We perform the UMAP and we add metadata informations
+cell_info_with_dimensionality_reduction <-
+    cell_info_with_dimensionality_reduction %>%
+    left_join(
+        gene_exp_umap_comps,
+        by = "cell_id")
+```
+
+## UMAP - Trascriptional profile
+
+In Figure \@ref(fig:geneUMAPRNA)), the cells are UMAP-ordinated by expression levels and colored by the membership we previously calculated using the reaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the reaction consistencies. In the other panels, the tissue and condition (b), cell type (c), and metabolic activity (d) are represented.
+
+```{r geneUMAPRNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_a <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by cluster membership") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_b <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by tissue and condition") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Tissue and Condition"))
+
+p_c <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by cell type") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+p_d <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by metabolic activity") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_a, p_b, p_c, p_d, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+
+```
+
+We can clearly see a separation in the UMAP based on cell type (panel c).
+
+## UMAP - Metabolic profile
+
+```{r geneUMAPmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_umap_cluster, p_m_umap_tissue_condition, p_m_umap_ct, p_m_umap_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## PCA - Trascriptional profile
+
+In Figure \@ref(fig:genePCARNA)), the cells are PCA-ordinated by expression levels and colored by the membership we previously calculated using the reaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the reaction consistencies. In the other panels, the tissue and condition (b), cell type (c), and metabolic activity (d) are represented.
+
+```{r genePCARNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The PCs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_a <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by cluster membership") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_b <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by tissue and condition") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Tissue and Condition"))
+
+p_c <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by cell type") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+p_d <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by metabolic activity") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_a, p_b, p_c, p_d, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+Interestingly, we can see a separation in the PCA based on metabolic clusters (panel a), tissue and condition (b), and cell type (panel c).
+
+## PCA - Metabolic profile
+
+```{r genePCAmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The PCAs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_pca_cluster, p_m_pca_tissue_condition, p_m_pca_ct, p_m_pca_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## Export annotations
+
+```{r}
+write.csv(x = 
+    cell_info_with_dimensionality_reduction[, 
+        c("cell_id", "cluster")], 
+    file = "../../data/alzheimer/cd8/cluster_annotation.csv", row.names = FALSE)
+```
+
+
+# Comparisons
+
+The following subsystems are of interest:
+
+```{r}
+facets <- c(
+    "Glycolysis/gluconeogenesis", 
+    "Galactose metabolism",
+    "Pyruvate metabolism",
+    "Citric acid cycle", 
+    "Fatty acid synthesis",
+    "Fatty acid oxidation", 
+    "Glycerophospholipid metabolism",
+    "Phosphatidylinositol phosphate metabolism",
+    "Androgen and estrogen synthesis and metabolism",
+    "Bile acid synthesis",
+    "Amino acid metabolism",
+    "Propanoate metabolism",
+    "Glutathione metabolism",
+    "Oxidative phosphorylation"
+    )
+print(facets)
+```
+
+Where the Amino acid metabolism collects all the amino acid related subsystems and the Citric acid cycle excludes all the non-mithocondrial localized reactions.
+
+```{r}
+get_faceted_results <- function(wilcox_results, facets){
+    faceted_results <- wilcox_results %>% 
+        filter(core == "Core Metabolism") %>%
+        # Exclude non-mitochondrially localized reactions from TCA.
+        mutate(subsystem = case_when(
+            reaction_id == "SPMDOX_pos" ~ 
+                "Arginine and Proline Metabolism",
+            subsystem == "Citric acid cycle" & 
+                !grepl("[m]", formula, fixed = TRUE) ~ 
+                "Other",
+            TRUE ~ subsystem )) %>%
+        # Assign reactions to the appropriate subsystem.
+        mutate(subsystem_priority = factor(subsystem) %>% 
+            fct_collapse("Amino acid metabolism" = c(
+                "Alanine and aspartate metabolism",
+                "Arginine and Proline Metabolism",
+                "beta-Alanine metabolism",
+                "Methionine and cysteine metabolism",
+                "D-alanine metabolism",
+                "Folate metabolism",
+                "Glutamate metabolism",
+                "Glycine, serine, alanine and threonine metabolism",
+                "Histidine metabolism",
+                "Lysine metabolism",
+                "Methionine and cysteine metabolism",
+                "Taurine and hypotaurine metabolism",
+                "Tryptophan metabolism",
+                "Tyrosine metabolism",
+                "Urea cycle",
+                "Valine, leucine, and isoleucine metabolism" )) %>%
+            fct_other(keep = facets) %>%
+            fct_relevel(facets))
+    
+    p_comp <- ggplot(faceted_results, aes(x = cohens_d, 
+        y = -log10(adjusted_p_value), color = subsystem_priority, 
+        text = reaction_name)) +
+        xlab("Cohen's d") + ylab("-log(BH-adjusted p-value)") + 
+        geom_point(size = 1, alpha = 0.5) +
+        geom_hline(yintercept = 1, linetype = "dashed", color = "blue") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +
+        theme_bw()
+    
+    return(list("faceted_results" = faceted_results, "plot" = ggplotly(p_comp)))
+}
+```
+
+
+Comparison example between WT and 3xTg cells by tissue
+
+## Brain
+
+### WT vs 3xTg
+
+```{r}
+colnames(compass_data$metareaction_consistencies) <- colnames(compass_data$reaction_consistencies) <- gsub(pattern = "[.]", replacement = "-", colnames(compass_data$metareaction_consistencies))
+
+brain_WT_3xTg <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Brain"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "condition", 
+    cluster_A = "3xTg", cluster_B = "WT", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figBrainWTvs3xTg) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figBrainWTvs3xTg, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(brain_WT_3xTg$p_DC_reactions, brain_WT_3xTg$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoBrain3xTgWT) are presented. 
+
+```{r}
+brain_WT_3xTg_results <- get_faceted_results(
+    wilcox_results = brain_WT_3xTg$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(brain_WT_3xTg_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id", 
+    "associated_genes", "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoBrain3xTgWT, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+brain_WT_3xTg_results$plot
+```
+
+The same results structure is followed by the next sections.
+
+### Itgae+ vs Itgae-
+
+```{r}
+brain_Itgae <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Brain"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "cell_type", 
+    cluster_A = "Itgae-", cluster_B = "Itgae+", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figBrainItgae) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figBrainItgae, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(brain_Itgae$p_DC_reactions, brain_Itgae$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoBrainItgae) are presented. 
+
+```{r}
+brain_Itgae_results <- get_faceted_results(
+    wilcox_results = brain_Itgae$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(brain_Itgae_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "associated_genes", "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoBrainItgae, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+brain_Itgae_results$plot
+```
+
+### Itgae-, WT vs 3xTg
+
+```{r}
+brain_Itgaeneg_WT_3xTg <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Brain" & cell_type == "Itgae-"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "condition", 
+    cluster_A = "3xTg", cluster_B = "WT", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figBrainItgaenegWT3xTg) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figBrainItgaenegWT3xTg, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(brain_Itgaeneg_WT_3xTg$p_DC_reactions, brain_Itgaeneg_WT_3xTg$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoBrainItgaenegWT3xTg) are presented. 
+
+```{r}
+brain_Itgaeneg_WT_3xTg_results <- get_faceted_results(
+    wilcox_results = brain_Itgaeneg_WT_3xTg$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(brain_Itgaeneg_WT_3xTg_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "associated_genes", "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoBrainItgaenegWT3xTg, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+brain_Itgaeneg_WT_3xTg_results$plot
+```
+
+## Meninges
+
+### WT vs 3xTg
+
+```{r}
+meninges_WT_3xTg <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Meninges"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "condition", 
+    cluster_A = "3xTg", cluster_B = "WT", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figMeningesWTvs3xTg) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figMeningesWTvs3xTg, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meninges_WT_3xTg$p_DC_reactions, meninges_WT_3xTg$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoMeninges3xTgWT) are presented. 
+
+```{r}
+meninges_WT_3xTg_results <- get_faceted_results(
+    wilcox_results = meninges_WT_3xTg$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meninges_WT_3xTg_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "associated_genes", "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoMeninges3xTgWT, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+meninges_WT_3xTg_results$plot
+```
+
+### Itgae+ vs Itgae-
+
+```{r}
+meninges_Itgae <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Meninges"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "cell_type", 
+    cluster_A = "Itgae-", cluster_B = "Itgae+", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figMeningesItgae) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figMeningesItgae, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meninges_Itgae$p_DC_reactions, meninges_Itgae$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoMeningesItgae) are presented. 
+
+```{r}
+meninges_Itgae_results <- get_faceted_results(
+    wilcox_results = meninges_Itgae$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meninges_Itgae_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "associated_genes",  "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoMeningesItgae, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+meninges_Itgae_results$plot
+```
+
+### Itgae-, WT vs 3xTg
+
+```{r}
+meninges_Itgaeneg_WT_3xTg <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(tissue == "Meninges" & cell_type == "Itgae-"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "condition", 
+    cluster_A = "3xTg", cluster_B = "WT", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figMeningesItgaenegWT3xTg) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figMeningesItgaenegWT3xTg, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meninges_Itgaeneg_WT_3xTg$p_DC_reactions, meninges_Itgaeneg_WT_3xTg$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoMeningesItgaenegWT3xTg) are presented. 
+
+```{r}
+meninges_Itgaeneg_WT_3xTg_results <- get_faceted_results(
+    wilcox_results = meninges_Itgaeneg_WT_3xTg$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meninges_Itgaeneg_WT_3xTg_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+   "associated_genes",  "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoMeningesItgaenegWT3xTg, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+meninges_Itgaeneg_WT_3xTg_results$plot
+```
+
+## 3xTg, Itgae-, meninges vs brain
+
+```{r}
+Itgaeneg_3xTg_Brain_Meninges <- compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction %>% filter(condition == "3xTg" & cell_type == "Itgae-"),
+    compass_analyzer = compass_analyzer, 
+    compass_data = compass_data, 
+    variable = "tissue", 
+    cluster_A = "Brain", cluster_B = "Meninges", 
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:figItgaeneg3xTgBrainMeninges) the number of core reactions (a) and their effect sizes (b), belonging to the significant metareactions are reported.
+
+```{r figItgaeneg3xTgBrainMeninges, fig.width=15, fig.height=9, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(Itgaeneg_3xTg_Brain_Meninges$p_DC_reactions, Itgaeneg_3xTg_Brain_Meninges$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcanoItgaeneg3xTgBrainMeninges) are presented. 
+
+```{r}
+Itgaeneg_3xTg_Brain_Meninges_results <- get_faceted_results(
+    wilcox_results = Itgaeneg_3xTg_Brain_Meninges$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(Itgaeneg_3xTg_Brain_Meninges_results$faceted_results[, c(
+    "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+   "associated_genes",  "cohens_d", 
+    "adjusted_p_value")], filter = "top", extensions = 'Buttons',
+    options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+    lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcanoItgaeneg3xTgBrainMeninges, fig.cap="Volcano plot for the reactions belonging to significant metareactions colored by subsistem of interest."}
+Itgaeneg_3xTg_Brain_Meninges_results$plot
+```

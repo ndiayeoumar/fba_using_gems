@@ -1,0 +1,89 @@
+---
+title: "using py package with R"
+author: "Oumar Ndiaye"
+date: '2022-06-10'
+output:
+  html_document:
+    code_folding: hide
+editor_options: 
+  markdown: 
+    wrap: 130
+---
+
+``` {r setup, include=FALSE}
+library(reticulate)
+# use_python("/usr/local/bin/python3")
+use_miniconda("/Users/oumarndiaye/Library/r-miniconda/envs/r-reticulate/bin/python")
+```
+
+
+```{r include=FALSE, message=FALSE}
+library(uwot)
+library(ggrepel)
+library(tidyverse)
+library(MASS)
+library(caret)
+
+source("../../lib/utility.R")
+source("../../lib/my_compassR/my_compass.R")
+```
+
+
+## Define our analysis settins
+```{r}
+settings <- list()
+input_path <- "../../../../results/new_approach/eae/tpm_counts/"
+metada_path <- "../../lib/my_compassR/metadata/"
+settings$gene_metadata_path <- paste0(metada_path, "gene_metadata.csv")
+settings$metabolite_metadata_path <-  paste0(metada_path, "metabolite_metadata.csv")
+settings$reaction_metadata_path <-  paste0(metada_path, "reaction_metadata.csv")
+settings$cell_metadata_path <- paste0(input_path, "cell_metadata.csv")
+settings$reaction_scores_path <- paste0(input_path, "reactions.tsv")
+settings$gene_expression_path <-paste0(input_path, "linear_gene_expression_matrix.tsv")
+settings$min_reaction_consistency <- 1e-10 # still to be defined but I'd prefer keeping it to the minimum possible
+settings$min_reaction_range <- 1e-3  # taken from Python version
+settings$reaction_direction_separator <- "_"
+settings$reaction_directions <- c("neg", "pos")
+settings$cluster_strength <- 0.1  # taken from compassR
+settings$gene_id_col_name <- "HGNC.symbol"
+settings$cell_id_col_name = "cell_id"
+```
+
+
+# Calculate reaction consistencies using python version
+
+```{python}
+import sys
+import pandas as pd
+import numpy as np
+
+# Converts the raw penalties outputs of compass into scores per reactions where higher numbers indicate more activity
+gene_expressions = pd.read_csv(r.settings["gene_expression_path"], sep="\t", index_col = 0)
+reaction_penalties = pd.read_csv(r.settings["reaction_scores_path"], sep = "\t", index_col = 0)
+cell_metadata = pd.read_csv(r.settings["cell_metadata_path"], index_col = 0)
+df = -np.log(reaction_penalties + 1)
+df = df[df.max(axis=1) - df.min(axis=1) >= r.settings["min_reaction_range"]]
+df = df - df.min().min()
+```
+
+## Build compass object
+```{r message=FALSE}
+
+r_compass <- build_my_compass_data(settings)
+py_scores <- py$df # access python variables
+r_scores <- r_compass$reaction_consistencies
+
+py_scores == r_scores
+table(colSums(py_scores) - colSums(r_scores))
+
+class(py_scores$`269072`)
+class(r_scores$`269072`)
+
+summary(py_scores$`269072`) ==
+summary(r_scores$`269072`)
+
+round(py_scores[1,1], 2) == round(r_scores[1,1], 2)
+
+
+```
+

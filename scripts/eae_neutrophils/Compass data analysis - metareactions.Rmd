@@ -1,0 +1,1322 @@
+---
+title: "Compass data analysis"
+subtitle: "An example of metabolic profiles anlysis of Neutrophil cells in EAE based on meta-reactions"
+author: 
+    - Matteo Calgaro
+date: "`r Sys.Date()`"
+output: 
+    bookdown::html_document2:
+        code_folding: hide
+        toc: yes
+        toc_float: true
+        number_section: yes
+        fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+# Introduction
+
+In this analysis we will start from the meta-reactions consistencies. meta-reactions are clusters representing a set of closely correlated metabolic reactions.
+Note that the division into meta-reactions is data-driven and does not rely on canonical metabolic pathway definitions. Therefore, the division is dataset-dependent — for example, two reactions might be closely correlated and clustered in the same meta-reaction in one cell type, but not in another.
+
+# Loading libraries
+
+The modified `compassR` version is in this repository. To install it the following command can be run:
+
+```{r, eval=FALSE}
+devtools::install_github("mcalgaro93/compassR")
+```
+
+Then, we load some packages for data manipulation and visualization.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE}
+library(compassR)
+# To manipulate data
+library(dplyr)
+library(plyr)
+# To plot/visualize data
+library(ggplot2)
+library(ggalluvial)
+library(plotly)
+library(cowplot)
+library(DT)
+library(forcats)
+library(tidytext)
+library(pheatmap)
+```
+
+# Loading data
+
+To perform COMPASS post-processing some settings must be chosen. By setting the class object compassSettings, it is possible to define:
+
+-   the metabolic model directory;
+
+-   the genes, metabolites, reactions, and cells metadata;
+
+-   the user data directory;
+
+-   the COMPASS's output with the reaction penalties;
+
+-   the gene expression input matrix;
+
+-   column names for cells and genes;
+
+-   some naming option for the direction of reactions;
+
+-   the minimum range of variation for a reaction to be kept (not variable reactions are removed);
+
+-   the cut height for the hierarchical clustering used to define meta-reactions
+
+```{r}
+user_data_directory <- "../../data/eae/neutrophils/tpm_counts_normalized"
+settings <- CompassSettings$new(
+    metabolic_model_directory = system.file("extdata", 
+        "RECON2", package = "compassR"),
+    gene_metadata_file = "gene_metadata.csv",
+    metabolite_metadata_file = "metabolite_metadata.csv",
+    reaction_metadata_file = "reaction_metadata.csv",
+    user_data_directory = user_data_directory,
+    cell_metadata_file = "cell_metadata.csv",
+    compass_reaction_scores_file = "reactions.tsv",
+    linear_gene_expression_matrix_file = "linear_gene_expression_matrix.tsv",
+    cell_id_col_name = "cell_id",
+    gene_id_col_name = "MGI.symbol",
+    reaction_direction_separator = "_",
+    reaction_directions = c("pos", "neg"),
+    min_reaction_consistency = 1e-04, # Not used
+    min_reaction_range = 1e-03,
+    cluster_strength = 0.02 # Spearman correlation 0.98
+)
+```
+
+To run the COMPASS post-processing the CompassData object must be created. This procedure is quite time expensive. For this reason we create this object once and then we can load it.
+
+```{r}
+if(!file.exists("../../data/eae/neutrophils/eae_neutrophils_compass_data_mgi.rds")){
+    compass_data <- CompassData$new(settings = settings)
+    saveRDS(compass_data, 
+        file = "../../data/eae/neutrophils/eae_neutrophils_compass_data_mgi.rds")
+} else compass_data <- readRDS("../../data/eae/neutrophils/eae_neutrophils_compass_data_mgi.rds")
+```
+
+The compassData object contains several information:
+
+-   the reaction and meta-reaction consistencies;
+
+-   metabolic genes;
+
+-   genes, cells, reactions, and metabolites metadata
+
+```{r}
+compass_data$cell_metadata$cell_id <- make.names(compass_data$cell_metadata$Cell.name, unique = TRUE)
+index_eae <- which(compass_data$cell_metadata$Condition == "EAE")
+compass_data$cell_metadata <- compass_data$cell_metadata[index_eae, ]
+
+compass_data$gene_expression_statistics <- compass_data$gene_expression_statistics[index_eae, ]
+
+colnames(compass_data$metareaction_consistencies) <- make.names(colnames(compass_data$metareaction_consistencies), unique = TRUE)
+colnames(compass_data$reaction_consistencies) <- make.names(colnames(compass_data$reaction_consistencies), unique = TRUE)
+
+compass_data$reaction_consistencies <- compass_data$reaction_consistencies[, index_eae]
+
+compass_data$metareaction_consistencies <- compass_data$metareaction_consistencies[, index_eae]
+```
+
+To proceed with the analysis, a CompassAnalyzer object is created. Two functions are natively available:
+
+-   `conduct_wilcoxon_test()` to conduct a wilcoxon test to compare reaction differential consistency between group of cells;
+
+-   `get_umap_components()` to ordinate the cells based on metabolic profiles.
+
+We added a new function which is `get_pca_components()` to compute principal components analysis (PCA) consistencies matrix.
+
+```{r}
+compass_analyzer <- CompassAnalyzer$new(settings)
+```
+
+# Data exploration
+
+We want to explore the meta-reactions consistencies. But the data set is very large so we need to reduce the dimensionality of our data. We perform two different unsupervised approaches of dimensionality reduction: Uniform Manifold Approximation and Projection (**UMAP**) and **PCA**. Here we compute the dimensionality reductions on the meta-reaction consistencies which is the main difference with the analysis on the reaction consistencies. This should lead to results slightly different from the other analysis titled "Compass data analysis - reactions".
+
+```{r}
+# We set a seed for UMAP reproducibility
+# https://bugs.r-project.org/show_bug.cgi?id=17494 explains why "Rejection"
+set.seed(5)
+# get UMAP components
+umap_components <- compass_analyzer$get_umap_components(
+    compass_data$metareaction_consistencies,
+    num_components = 5)
+# get PCA components
+pca_components <- compass_analyzer$get_pca_components(
+    compass_data$metareaction_consistencies,
+    num_components = 5)
+# merge PCA and UMAP components
+components <- inner_join(
+    x = umap_components,
+    y = pca_components,
+    by = "cell_id")
+
+# add metadata to the components
+cell_info_with_dimensionality_reduction <-
+    components %>% 
+    dplyr::inner_join(
+        compass_data$cell_metadata,
+        by = "cell_id"
+    ) %>%
+    left_join(
+        compass_data$gene_expression_statistics,
+        by = "cell_id"
+    )
+```
+
+### UMAP
+
+It is a non-linear dimensional reduction method which is very effective for visualizing clusters or groups of data points and their relative proximities.
+
+```{r message=FALSE, error=FALSE}
+# UMAP components are computed as characters. 
+# We convert them in numeric values
+# just focusing on the first 3 components
+cell_info_with_dimensionality_reduction$component_1 <- 
+    -as.numeric(cell_info_with_dimensionality_reduction$component_1)
+cell_info_with_dimensionality_reduction$component_2 <- 
+    -as.numeric(cell_info_with_dimensionality_reduction$component_2)
+cell_info_with_dimensionality_reduction$component_3 <- 
+    -as.numeric(cell_info_with_dimensionality_reduction$component_3)
+# the inversion of the signs have effect only on the visualization of the graphs and not on the compositions of the clusters to be formed eventually.
+```
+
+#### Stage
+
+In Figure \@ref(fig:rUmapByStage) promiscuous groups of cells are clearly visible. Each group contains cells of both stages. At first sight we can say that the first two UMAP dimensions don't separate cells based on their stage.
+
+```{r rUmapByStage, fig.cap="Each dot represents a single cell coloured based on their stage (Chronic or Onset)."}
+p_m_umap_stage <- ggplot(
+  cell_info_with_dimensionality_reduction,
+  aes(x = component_1,
+      y = component_2,
+      color = Stage)) +
+  geom_point(alpha = 0.3) +
+  theme(legend.position = "bottom") +
+  ggtitle("UMAP (based on reaction scores)  coloured by stage") +
+  xlab(label = "UMAP 1") +
+  ylab(label = "UMAP 2") +
+  theme(legend.position = "bottom")
+
+p_m_umap_stage
+```
+
+Figure \@ref(fig:rUmap3dByStage) 3D plotting of the UMAP components of the metabolic profile.
+
+```{r rUmap3dByStage, fig.cap="3D representation of the first 3 UMAP components"}
+plot_ly(
+  data = cell_info_with_dimensionality_reduction,
+  x = ~ component_1,
+  y = ~ component_2,
+  z = ~ component_3,
+  color = ~ Stage,
+  size = 1) %>% 
+  layout(title ="UMAP 3D plot - cells coloured by stage") 
+```
+
+#### Metabolic activity
+
+On the summary of our `compassData` object we have *gene_expression* table containing the columns `total_expression`, `metabolic_expression`, and `metabolic_activity`. A cell's "total expression" is the extent to which it expresses any of its genes. Its "metabolic expression" is the extent to which it expresses its metabolic genes. And finally, its "metabolic activity" is the ratio of its metabolic expression to its total expression. In Figure \@ref(fig:rumapbymetabolicactivity), cells within the same group present different metabolic activities. Therefore they don't seem to be segregated based on their metabolic activity levels. Also here we see a very narrow range of metabolic activity values, meaning that most of the genes these cells express do not belong to the genome-scale metabolic model RECON2.
+
+```{r rumapbymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_umap_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP (based on reaction scores) coloured by metabolic activity") +
+    xlab(label ="UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_umap_ma
+```
+
+#### PMN Clusters
+
+In Figure \@ref(fig:rumappmnclusters), cells are colored according to their cluster membership (PMN).
+
+```{r rumappmnclusters, fig.cap="Each dot represents a single cell coloured based on their PMN cluster membership."}
+# umap according to metabolic activity
+p_m_umap_pmn <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = PMN.clusters)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP (based on reaction scores) coloured by PMN cluster membership") +
+    xlab(label ="UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom")
+
+p_m_umap_pmn
+```
+
+### PCA
+
+It is accomplished by linearly transforming the data into a new coordinate system where (most of) the variation in the data can be described with fewer dimensions than the initial data. Many studies use the first two principal components (PCs) in order to plot the data in two dimensions and visually identify clusters of closely related data points .
+
+#### Stage
+
+In Figure \@ref(fig:rpcabystage) two promiscuous groups of cells are clearly visible. Each group contains cells of both stages. At first sight we can say that the first two PCs don't separate cells based on their stage.
+
+```{r rpcabystage, fig.cap="Each dot represents a single cell coloured based on their stage (Chronic or Onset)."}
+p_m_pca_stage <- ggplot(cell_info_with_dimensionality_reduction, aes(x = PCA_1, 
+    y = PCA_2, color = Stage)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA (based on reaction scores) coloured by stage") +
+    xlab(label = "PC 1") +
+    ylab(label = "PC 2") +
+    theme(legend.position = "bottom")
+
+p_m_pca_stage
+```
+
+#### Metabolic activity
+
+In Figure \@ref(fig:rpcabymetabolicactivity), we can see a barely visible group of cells with higher metabolic activity in the lower-right part of the plot.
+
+```{r rpcabymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_pca_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA (based on reaction scores) coloured by metabolic activity") +
+    xlab(label ="PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_pca_ma
+```
+
+#### PMN Clusters
+
+In Figure \@ref(fig:rpcapmnclusters), cells are colored according to their cluster membership (PMN).
+
+```{r rpcapmnclusters, fig.cap="Each dot represents a single cell coloured based on their PMN cluster membership."}
+# umap according to metabolic activity
+p_m_pca_pmn <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = PMN.clusters)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA (based on reaction scores) coloured by PMN cluster membership") +
+    xlab(label ="PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom")
+
+p_m_pca_pmn
+```
+
+## Clustering
+
+To automatically detect the number of clusters, we will use the function `get_optimal_clusters()` to identify the number of clusters which maximizes the silhouette index.
+
+```{r avgSilPlot, fig.cap="Average silhouette indexes for several number of clusters. The hierarchical clustering algorithm on 'euclidean' distances using the 'average' agglomeration method has been used.", fig.width=8, fig.height=5}
+opt_cl <- get_optimal_clusters(
+  UMAPcoords = cell_info_with_dimensionality_reduction[, c("component_1", "component_2", "component_3", "component_4", "component_5")], method = "average",
+  k.values = 2:15,
+  plotIt = TRUE)
+```
+
+The optimal number of clusters is 3. To obtain the cluster membership for each cell, the `function get_cluster()` can be used. The number of cells in each cluster, stratified by cell subset and stage is summarized in Figure \@ref(fig:plotCellTypeCluster).
+
+```{r clusterMembership}
+cell_info_with_dimensionality_reduction$cluster <- as.factor(get_cluster(
+    df = cell_info_with_dimensionality_reduction[, c("component_1", "component_2", "component_3")],
+    k = opt_cl))
+# kableExtra::kable(
+#     x = table(cell_info_with_dimensionality_reduction$cluster), 
+#     caption = "Number of cells for each cluster.",
+#     col.names = c("Cluster", "N Cells"), booktabs = TRUE)
+```
+
+The UMAP representation is visible in Figure \@ref(fig:rUMAPbycluster).
+
+```{r rUMAPbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership.", fig.width=8, fig.height=5}
+p_m_umap_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on reaction scores) coloured by cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set2")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_umap_cluster
+```
+
+The PCA representation is visible in Figure \@ref(fig:rPCAbycluster).
+
+```{r rPCAbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_pca_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on reaction scores) coloured by cluster") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(8, "Set2")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_pca_cluster
+```
+
+# Summary
+
+Before moving on with deeper analysis of these clusters, it would be interesting to investigate the UMAP and PCA representations based on the gene expression values with the information about the cluster membership of the cells based on their metabolic profile. In case of systematic patterns, we shall assume that there might be a direct association between gene expression levels and their reactions.
+
+```{r}
+gene_exp_umap_comps <- read.delim(file = "../../data/eae/neutrophils/Neutrophils_EAE_batched_UMAP_coordinates.csv")
+gene_exp_umap_comps <- data.frame("UMAP1" = t(gene_exp_umap_comps[1,-1])[index_eae], 
+                                  "UMAP2" = t(gene_exp_umap_comps[2,-1])[index_eae],
+                                  "cell_id" = (colnames(gene_exp_umap_comps)[-1])[index_eae])
+
+gene_exp_pca_comps <- read.delim(file = "../../data/eae/neutrophils/Neutrophils_EAE_batched_PCA_coordinates.csv")
+gene_exp_pca_comps <- data.frame("PCA1" = t(gene_exp_pca_comps[1,-1])[index_eae], 
+                                  "PCA2" = t(gene_exp_pca_comps[2,-1])[index_eae],
+                                  "cell_id" = (colnames(gene_exp_pca_comps)[-1])[index_eae])
+
+# We perform the UMAP and we add metadata informations
+cell_info_with_dimensionality_reduction <-
+    cell_info_with_dimensionality_reduction %>%
+    left_join(
+        gene_exp_umap_comps,
+        by = "cell_id") %>%
+    left_join(
+        gene_exp_pca_comps,
+        by = "cell_id")
+```
+
+## UMAP - Transcriptional profile
+
+In Figure \@ref(fig:geneUMAPRNA)), the cells are UMAP-ordinated by expression levels and coloured by the membership we previously calculated using the metareaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the metareaction consistencies (maybe a slightly increased abundance of oranges on the top). In the other panels, the Stage (b), PMN cluster membership (c), and metabolic activity (d) are represented.
+
+```{r geneUMAPRNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the metareaction consistencies (a), Stage (b), PMN cluster membership (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_t_umap_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) coloured by cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set2")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_t_umap_stage <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = as.factor(Stage))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) coloured by stage") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Stage"))
+
+p_t_umap_pnm <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = as.factor(PMN.clusters))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) coloured by PMN cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "PMN cluster"))
+
+p_t_umap_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) coloured by metabolic activity") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_t_umap_cluster, p_t_umap_stage, p_t_umap_pnm, p_t_umap_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+
+```
+
+## UMAP - Metabolic profile
+
+```{r geneUMAPmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the metareaction consistencies (a), stage (b), cell subset (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_umap_cluster, p_m_umap_stage, p_m_umap_pmn, p_m_umap_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## PCA - Transcriptional profile
+
+In Figure \@ref(fig:genePCARNA)), the cells are PCA-ordinated by expression levels and coloured by the membership we previously calculated using the metareaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the metareaction consistencies. In the other panels, the stage (b), cell subset (c), and metabolic activity (d) are represented.
+
+```{r genePCARNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the metareaction consistencies (a), stage (b), cell subset (c), and metabolic activity (d). The PCs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_t_pca_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) coloured by cluster") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(4, "Set2")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_t_pca_stage <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = as.factor(Stage))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) coloured by stage") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Stage"))
+
+p_t_pca_pmn <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = PMN.clusters)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) coloured by PMN cluster membership") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(4, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend( title = "Cell subset"))
+
+p_t_pca_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) coloured by metabolic activity") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_t_pca_cluster, p_t_pca_stage, p_t_pca_pmn, p_t_pca_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## PCA - Metabolic profile
+
+```{r genePCAmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the metareaction consistencies (a), Stage (b), PMN cluster membership (c), and metabolic activity (d). The PCAs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_pca_cluster, p_m_pca_stage, p_m_pca_pmn, p_m_pca_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## Focus - Chronic vs Onset
+
+``` {r genePCAUMAP, fig.cap="PCA (a) and UMAP (b) applied to gene expression. Each dot represents a cell coloured by stage.", fig.width=10, fig.height=5}
+cowplot::plot_grid(p_t_pca_stage, p_t_umap_stage, nrow = 1, align = "hv", axis = "tblr", labels = "auto")
+```
+Figure \@ref(fig:genePCAUMAP) summarises both UMAP and PCA applied on the transcriptomic data coloured by stage (chronic vs onset). None of the approaches creates separated clusters.
+
+``` {r metabolicPCAUMAP, fig.cap="PCA (a) and UMAP (b) applied to metabolic reaction scores computed by Compass. Each dot represents a cell coloured by stage", fig.width=10, fig.height=5}
+cowplot::plot_grid(p_m_pca_stage, p_m_umap_stage, nrow = 1, align = "hv", axis = "tblr", labels = "auto")
+```
+Figure \@ref(fig:metabolicPCAUMAP) summarises both UMAP and PCA applied on the metareaction scores coloured by stage (chronic vs onset). More clearly defined clusters become apparent, particularly with UMAP. This implies that these data might provide more valuable insights compared to transcriptomic data. Nevertheless, it was intriguing to observe the lack of clear cell segregation based on their inflammatory status, contrary to what was anticipated. This prompted us to conduct a more in-depth investigation to comprehend the distinct features that played a role in the development of these segregated groups.
+
+## Export annotations
+
+```{r}
+write.csv(x = 
+    cell_info_with_dimensionality_reduction[, 
+        c("cell_id", "cluster")], 
+    file = "../../data/eae/neutrophils/cluster_annotation.csv", row.names = FALSE)
+```
+
+# Comparisons
+
+## Introduction
+
+Given that none of the features seems to discriminate cells into different clusters, we will analyse the clusters metabolic profiles in 2 ways:
+
+-   One vs all others: trying to determine what unite the cells in each single cluster
+
+-   One vs one: to point out the main differences between the clusters
+
+Firstly, we compare the metabolic meta-reactions which are cluster-specific. The same procedure performed to detect differentially consistent reactions can be performed to detect differentially consistent meta-reactions. The `compare_cluster()` function with `for_metareactions = TRUE` can be used. This way, we then perform the Wilcoxon test using the meta-reaction consistencies. Given the labels of the two groups of cells to be compared, it returns:
+
+-   the matrix of wilcoxon results with reactions metadata;
+
+-   the differentially consistent reactions or meta-reactions belonging to the core metabolism;
+
+-   the same table in a ready-to-plot format;
+
+-   two plot visualization of the differentially consistent reactions.
+
+As they did in the article, at this point, the meta-reaction results data frame is expanded out to each reaction that makes up the meta-reactions so that the metadata can be joined to it and used to generate plots and tables. We will be focusing then on reactions defined as core metabolic, that is, reactions that:
+
+-   are significant, *i.e.*, adjusted p-value \< 0.05;
+
+-   have a known E.C. number (the Enzyme Commission number is a numerical classification scheme for enzymes, based on the chemical reactions they catalyze. As a system of **enzyme nomenclature**, every EC number is associated with a recommended name for the corresponding enzyme-catalysed reaction).
+
+-   have a confidence parameter equal to 0 (denoting reactions whose confidence was not evaluated) or 4 (denoting reactions whose confidence is supported by biochemical evidence).
+
+This allows us to identify the differentially consistent reactions of the core metabolism (based on reaction metadata included in the Recon2 database). Since pathways generally considered part of primary metabolism are also the best studied ones, we define a reaction as belonging to core metabolism if (a) its Recon2 confidence is either 0 or 4; *and* (b) it is annotated with an EC (Enzyme Commission) number. We chose to label reactions with unevaluated confidence (i.e., Recon2 confidence score of 0) as part of core metabolism because some of them were found to be key reactions in primary metabolic pathways based on manual correction. Our definition of core metabolism is equivalent to taking the set of all metabolic reactions in Recon2, but excluding reactions that either don't have an annotated EC number or for which the Recon2 curators explicitly specified they do not have direct biochemical support.
+
+```{r}
+colnames(compass_data$metareaction_consistencies) <- colnames(compass_data$reaction_consistencies) <- gsub(pattern = "[.]", replacement = "-", colnames(compass_data$metareaction_consistencies))
+
+```
+
+Furthermore we also have a set of subsystems of interest. A subsystem is a set of reactions that share a similar metabolic function.
+
+```{r}
+facets <- c("Glycolysis/gluconeogenesis",
+    "Citric acid cycle",
+    "Fatty acid synthesis",
+    "Fatty acid oxidation",
+    "Amino acid metabolism")
+cat(facets, sep = "\n")
+```
+
+We will call them subsystem_priority(s). The Amino acid metabolism subsystem_priority collects all the amino acid related subsystems and the Citric acid cycle excludes all the non-mitochondrial localized reactions. All the remaining subsystems will be gathered into the subsystem_priority "Other".
+
+```{r}
+get_faceted_results <- function(wilcox_results, facets) {
+    faceted_results <- wilcox_results %>% 
+        filter(core == "Core Metabolism") %>%
+        # Exclude non-mitochondrially localized reactions from TCA.
+        mutate(subsystem = case_when(
+            reaction_id == "SPMDOX_pos" ~ 
+                "Arginine and Proline Metabolism",
+            subsystem == "Citric acid cycle" & 
+                !grepl("[m]", formula, fixed = TRUE) ~ 
+                "Other",
+            TRUE ~ subsystem )) %>%
+        # Assign reactions to the appropriate subsystem.
+        mutate(subsystem_priority = factor(subsystem) %>% 
+            fct_collapse("Amino acid metabolism" = c(
+                "Alanine and aspartate metabolism",
+                "Arginine and Proline Metabolism",
+                "beta-Alanine metabolism",
+                "Methionine and cysteine metabolism",
+                "D-alanine metabolism",
+                "Folate metabolism",
+                "Glutamate metabolism",
+                "Glycine, serine, alanine and threonine metabolism",
+                "Histidine metabolism",
+                "Lysine metabolism",
+                "Methionine and cysteine metabolism",
+                "Taurine and hypotaurine metabolism",
+                "Tryptophan metabolism",
+                "Tyrosine metabolism",
+                "Urea cycle",
+                "Valine, leucine, and isoleucine metabolism" )) %>%
+            fct_other(keep = facets) %>%
+            fct_relevel(facets))
+    
+    p_comp <- ggplot(faceted_results, aes(x = cohens_d, 
+        y = -log10(adjusted_p_value), color = subsystem_priority, 
+        text = reaction_name)) +
+        xlab("Cohen's d") + ylab("-log(BH-adjusted p-value)") +
+        facet_wrap(~ subsystem_priority) +
+        geom_point(size = 1, alpha = 0.5) +
+        geom_hline(yintercept = 1, linetype = "dashed", color = "blue") +
+        geom_vline(xintercept = 0, linetype = "dashed", color = "blue") +
+        theme_bw()
+    
+    return(list("faceted_results" = faceted_results, "plot" = ggplotly(p_comp)))
+}
+```
+
+## Cluster Composition
+
+```{r plotCellTypeCluster, fig.cap="Cells distribution across stages and clusters.", fig.height=6, fig.width=4}
+# Count how many cells for each cluster, stage, PMN cluster
+df_cluster <- plyr::ddply(.data = cell_info_with_dimensionality_reduction, 
+    .variables = ~ cluster + Stage + PMN.clusters, 
+    function(cells) return(data.frame("n" = nrow(cells))))
+
+# Count how many cells for each cluster
+df_cluster_summary <- df_cluster %>% 
+    group_by(cluster) %>%
+    dplyr::summarize(n = sum(n)) %>%
+    arrange(desc(n))
+
+# Order the cluster levels for the summary
+df_cluster_summary$cluster <- factor(df_cluster_summary$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+# Order the cluster levels for the df
+df_cluster$cluster <- factor(df_cluster$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+
+# Generate table with the frequencies
+main_plot <- ggplot(data = df_cluster, 
+    aes(x = cluster, y = PMN.clusters)) +
+    # coord_equal() + 
+    geom_tile(aes(fill = PMN.clusters, alpha = n), width = 0.8, height = 0.8) +
+    geom_text(aes(label = n)) + 
+    facet_grid(Stage ~ ., scales = "free", space = "free") +
+    scale_x_discrete(breaks = 1:6) +
+    ylab("PMN cluster") +
+    scale_fill_manual(guide = "none", values = RColorBrewer::brewer.pal(n = 12, "Set3")) +
+    scale_alpha_continuous(guide = "none")
+
+# Generate a barplot with the total cells in each clusters
+over_strip <- ggplot(data = df_cluster_summary, 
+    aes(x = cluster, y = n, fill = cluster)) +
+    geom_col(aes(alpha = n), width = 0.8) +
+    geom_text(aes(label = n, y = n + 5)) + 
+    scale_x_discrete(breaks = df_cluster_summary$cluster) +
+    scale_alpha_continuous(guide = "none") +
+    theme_void() +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(opt_cl, "Set2"), breaks = c(1:opt_cl)) +
+    theme(legend.position = "none")
+
+# Combine the two plots
+cowplot::plot_grid(over_strip, main_plot, ncol = 1, axis = "lr", align = "v", rel_heights = c(1,5))
+```
+
+The number of cells in each cluster, stratified by stage is summarized in Figure \@ref(fig:plotCellStageCluster).
+
+```{r plotCellStageCluster, fig.cap="Cells distribution across stages and clusters.", fig.height=5, fig.width=4}
+# Count how many cells for each cluster, stage
+df_cluster <- plyr::ddply(.data = cell_info_with_dimensionality_reduction, 
+    .variables = ~ cluster + Stage,  
+    function(cells) return(data.frame("n" = nrow(cells))))
+
+# Count how many cells for each cluster
+df_cluster_summary <- df_cluster %>% 
+    group_by(cluster) %>%
+    dplyr::summarize(n = sum(n)) %>%
+    arrange(desc(n))
+
+# Order the cluster levels for the summary
+df_cluster_summary$cluster <- factor(df_cluster_summary$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+# Order the cluster levels for the df
+df_cluster$cluster <- factor(df_cluster$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+
+# Generate table with the frequencies
+main_plot <- ggplot(data = df_cluster, 
+    aes(x = cluster, y = Stage)) +
+    geom_tile(aes(fill = Stage, alpha = n), width = 0.5, height = 0.5) +
+    geom_text(aes(label = n)) +
+    scale_x_discrete(breaks = 1:5) +
+    # ylab("stage") +
+    scale_fill_manual(guide = "none", values = RColorBrewer::brewer.pal(n = 12, "Set3")) +
+    scale_alpha_continuous(guide = "none")
+
+# Generate a barplot with the total cells in each clusters
+over_strip <- ggplot(data = df_cluster_summary, 
+    aes(x = cluster, y = n, fill = cluster)) +
+    geom_col(aes(alpha = n), width = 0.5) +
+    geom_text(aes(label = n, y = n + 5)) + 
+    scale_x_discrete(breaks = df_cluster_summary$cluster) +
+    scale_alpha_continuous(guide = "none") +
+    theme_void() +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(opt_cl, "Set2"), breaks = c(1:opt_cl)) +
+    theme(legend.position = "none")
+
+# Combine the two plots
+cowplot::plot_grid(over_strip, main_plot, ncol = 1, axis = "lr", align = "v", rel_heights = c(1,2))
+```
+
+
+The UMAP representation is visible in Figure \@ref(fig:rUmapByCluster).
+
+```{r rUmapByCluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP coloured by cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(4, "Set2")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_cluster
+```
+
+## One against All
+
+### Cluster 1 vs All
+
+The group A corresponds to cells in cluster 1, and the group B regroup the other cells.
+
+```{r}
+cell_ids <- paste0("Cell",
+    1:nrow(cell_info_with_dimensionality_reduction))
+cell_info_with_dimensionality_reduction$cell_id <- cell_ids
+colnames(compass_data$metareaction_consistencies) <- cell_ids
+
+meta_1_all <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = "1",
+    cluster_B = c("2","3"),
+    for_metareactions = TRUE,
+    core_levels_to_plot = "Core Metabolism")
+```
+
+
+In Figure \@ref(fig:fig1VsAll) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig1VsAll, fig.width=15, fig.height=13, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_1_all$p_DC_reactions , meta_1_all$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 1, while negative values represent reactions that are more consistent in all the other clusters. To summarize the results, several plots are proposed.
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano1VsAll) are presented.
+
+```{r, fig.width=12, fig.height=10}
+meta_1_all_results <- get_faceted_results(
+    wilcox_results = meta_1_all$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_1_all_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano1VsAll, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_1_all_results$plot
+```
+
+The same results structure is followed by the next sections.
+
+### Cluster 2 vs All
+
+The group A corresponds to cells in cluster 2, and the group B regroup the other cells.
+
+```{r}
+meta_2_all <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = 2,
+    cluster_B = c(1,3),
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig2VsAll) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig2VsAll, fig.width=15, fig.height=10, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_2_all$p_DC_reactions, meta_2_all$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 2, while negative values represent reactions that are more consistent in all the other clusters. To summarize the results, several plots are proposed.
+
+To furtherly inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano2VsAll) are presented.
+
+```{r}
+meta_2_all_results <- get_faceted_results(
+    wilcox_results = meta_2_all$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_2_all_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano2VsAll, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_2_all_results$plot
+```
+
+### Cluster 3 vs All
+
+The group A corresponds to cells in cluster 3, and the group B regroup the other cells.
+
+```{r}
+meta_3_all <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = 3,
+    cluster_B = c(1,2),
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig3VsAll) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig3VsAll, fig.width=15, fig.height=6, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(
+    meta_3_all$p_DC_reactions,
+    meta_3_all$p_DC_reactions_cohensd + 
+        scale_color_manual(values = scales::hue_pal()(2)), labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 1, while negative values represent reactions that are more consistent in all the other clusters. To summarize the results, several plots are proposed.
+
+To further inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano3VsAll) are presented.
+
+```{r}
+meta_3_all_results <- get_faceted_results(
+    wilcox_results = meta_3_all$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_3_all_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano3VsAll, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_3_all_results$plot
+```
+
+### Summary image
+
+Figure \@ref(fig:figSumOneVsAll) serves as a summary of the single comparisons between one cluster against all the others. Given all the subsystems, and for each comparison, the heatmap reports a logarithmically scaled difference in number of significant reactions differentially consistent in the cluster and the number of significant reactions differentially consistent in the other clusters put together.
+
+```{r figSumOneVsAll, fig.cap="Summary of all one-vs-all cluster comparisons. The signed logarithm of differences between the number of differentially consistent reactions between the two cluster groups is used to color the heatmap. A blueish shade means that the reactions are more consistent on the second group of cells, a redish shade means that the reactions are more consistent on the first group of cells.", fig.width=7, fig.height=10}
+# Collect all tables
+meta_all <- data.frame(rbind(
+    cbind("Cluster" = "Cluster 1 vs All", meta_1_all_results$faceted_results),
+    cbind("Cluster" = "Cluster 2 vs All", meta_2_all_results$faceted_results),
+    cbind("Cluster" = "Cluster 3 vs All", meta_3_all_results$faceted_results)
+)) %>% 
+    select(Cluster, subsystem, reaction_name, reaction_id, 
+        cohens_d, adjusted_p_value) %>%
+    filter(adjusted_p_value <= 0.05) %>%
+    group_by(Cluster, subsystem) %>%
+    summarise(Freqpos = sum(cohens_d > 0),
+              Freqneg = sum(cohens_d < 0)) %>%
+    mutate(Freq = sign(Freqpos - Freqneg)*log1p(abs(Freqpos - Freqneg))) %>%
+    select(-c(Freqpos, Freqneg))
+
+meta_all_wide <- reshape2::dcast(meta_all, subsystem ~ Cluster, fill = 0)
+rownames(meta_all_wide) <- meta_all_wide$subsystem
+
+# set matrix to plot
+mat <- meta_all_wide[,2:4]
+paletteLength <- 50
+myColor <- colorRampPalette(
+    rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(paletteLength)
+# length(breaks) == length(paletteLength) + 1
+# use floor and ceiling to deal with even/odd length pallettelengths
+my_breaks <- c(seq(min(mat), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+
+pheatmap(mat,
+         color = myColor,
+         scale = "none",
+         cluster_cols = FALSE, 
+         main = "One vs All clusters comparisons
+         \n Summary heatmap",
+         breaks = my_breaks)
+```
+
+## One against One
+
+Now we move on comparing one cluster against another to observe and highlight their differences.
+
+### Cluster 1 vs cluster 2
+
+The group A corresponds to cells in cluster 1, and the group B represents cluster 2.
+
+```{r}
+meta_1_2 <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = 1,
+    cluster_B = 2,
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig1Vs2) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig1Vs2, fig.width=15, fig.height=10, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_1_2$p_DC_reactions, meta_1_2$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 1, while negative values represent reactions that are more consistent in cluster 2. To summarize the results, several plots are proposed.
+
+Now we inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano1Vs2) are presented.
+
+```{r}
+meta_1_2_results <- get_faceted_results(
+    wilcox_results = meta_1_2$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_1_2_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano1Vs2, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_1_2_results$plot
+```
+
+
+### Cluster 1 vs cluster 3
+
+The group A corresponds to cells in cluster 1, and the group B represents cluster 3.
+
+```{r}
+meta_1_3 <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = 1,
+    cluster_B = 3,
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig1Vs3) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig1Vs3, fig.width=15, fig.height=7, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_1_3$p_DC_reactions, meta_1_3$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 1, while negative values represent reactions that are more consistent in cluster 3. To summarize the results, several plots are proposed. 
+
+Let's inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano1Vs3) are presented.
+
+```{r}
+meta_1_3_results <- get_faceted_results(
+    wilcox_results = meta_1_3$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_1_3_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano1Vs3, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_1_3_results$plot
+```
+
+### Cluster 2 vs cluster 3
+
+The group A corresponds to cells in cluster 2, and the group B represents cluster 3.
+
+```{r}
+meta_2_3 <- compassR::compare_clusters(
+    cell_info = cell_info_with_dimensionality_reduction,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "cluster",
+    cluster_A = 2,
+    cluster_B = 3,
+    for_metareactions = TRUE, 
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig2Vs3) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig2Vs3, fig.width=15, fig.height=10, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_2_3$p_DC_reactions, meta_2_3$p_DC_reactions_cohensd, labels = "auto") 
+```
+
+The effect size is summarized by the Cohen's D statistic, which is computed as the difference between the mean of the two groups, divided by the pooled standard deviation. Positive values represent reactions which are more consistent in Cluster 2, while negative values represent reactions that are more consistent in cluster 3. To summarize the results, several plots are proposed. 
+
+Let's inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano2Vs3) are presented.
+
+```{r}
+meta_2_3_results <- get_faceted_results(
+    wilcox_results = meta_2_3$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_2_3_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano2Vs3, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_2_3_results$plot
+```
+
+### Summary image
+
+```{r figSumOneVsOne, fig.cap="Summary of all one-vs-one cluster comparisons. The signed logarithm of differences between the number of differentially consistent reactions between the two cluster groups is used to color the heatmap. A blueish shade means that the reactions are more consistent on the second group of cells, a redish shade means that the reactions are more consistent on the first group of cells.", fig.width=6, fig.height=12}
+# Collect all tables
+meta_pairwise <- data.frame(rbind(
+    cbind("Cluster" = "Cluster 1 vs Cluster 2",
+          meta_1_2_results$faceted_results),
+    cbind("Cluster" = "Cluster 1 vs Cluster 3",
+          meta_1_3_results$faceted_results),
+    cbind("Cluster" = "Cluster 2 vs Cluster 3",
+          meta_2_3_results$faceted_results)
+)) %>% 
+    select(Cluster, subsystem, reaction_name, reaction_id, 
+        cohens_d, adjusted_p_value) %>%
+    filter(adjusted_p_value <= 0.05) %>%
+    group_by(Cluster, subsystem) %>%
+    summarise(Freqpos = sum(cohens_d > 0),
+              Freqneg = sum(cohens_d < 0)) %>%
+    mutate(Freq = sign(Freqpos - Freqneg)*log1p(abs(Freqpos - Freqneg))) %>%
+    select(-c(Freqpos, Freqneg))
+
+meta_pairwise_wide <- reshape2::dcast(meta_pairwise, subsystem ~ Cluster, fill = 0)
+rownames(meta_pairwise_wide) <- meta_pairwise_wide$subsystem
+
+# set matrix to plot
+mat <- meta_pairwise_wide[,2:4]
+paletteLength <- 50
+myColor <- colorRampPalette(
+    rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(paletteLength)
+# use floor and ceiling to deal with even/odd length pallettelengths
+my_breaks <- c(seq(min(mat), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(mat)/paletteLength, max(mat), length.out=floor(paletteLength/2)))
+
+pheatmap(mat,
+         color = myColor,
+         scale = "none",
+         cluster_cols = FALSE, 
+         main = "Paiwise cluster comparisons \n Summary heatmap",
+         breaks = my_breaks)
+```
+
+## Chronic vs Onset inside a cluster
+
+Now we move on comparing the cells belonging to the two conditions inside a cluster. 
+
+### Cluster 1
+
+The group A corresponds to Onset cells, and the group B to the Chronic cells.
+
+```{r}
+# subset of cluster 1
+cluster_1 <- subset(x = cell_info_with_dimensionality_reduction, cluster =='1')
+```
+
+```{r figcluster1, fig.cap="Each dot represents a single cell of the Cluster 1, coloured by stage."}
+ellipse1_stage <- ggplot(cluster_1,
+    aes(x = component_1, y = component_2, color = Stage)) +
+    geom_point(alpha = 0.8) +
+    ggtitle(label = "UMAP for Cluster 1 cells",
+        subtitle = "Colored by Stage") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Stage")) +
+    stat_ellipse()
+ellipse1_stage
+```
+
+```{r, warning=FALSE}
+meta_1_stages <- compare_clusters(
+    cell_info = cluster_1,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "Stage",
+    cluster_A = "CHRONIC",
+    cluster_B = "ONSET",
+    for_metareactions = TRUE, # adjusted_p_value_th = 0.1,
+    core_levels_to_plot = "Core Metabolism")
+```
+
+In Figure \@ref(fig:fig1stages) the number of core reactions (a) and their effect sizes (b), belonging to the significant meta-reactions are reported.
+
+```{r fig1stages, fig.width=15, fig.height=10, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_1_stages$p_DC_reactions, meta_1_stages$p_DC_reactions_cohensd, labels = "auto")
+```
+
+Let's inspect the subsystems of interest, the following table and Figure \@ref(fig:figVolcano1stage) are presented.
+
+```{r}
+meta_1_stages_results <- get_faceted_results(
+    wilcox_results = meta_1_stages$wilcoxon_results_with_metadata,
+    facets = facets)
+
+DT::datatable(meta_1_stages_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano1stage, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_1_stages_results$plot
+```
+
+### Cluster 2
+
+The group A corresponds to Onset cells, and the group B to the Chronic cells.
+
+```{r}
+# subset of cluster 2
+cluster_2 <- subset(x = cell_info_with_dimensionality_reduction, cluster =='2')
+```
+
+```{r figcluster2, fig.cap="Each dot represents a single cell of the Cluster 2, coloured by stage."}
+ellipse2_stage <- ggplot(cluster_2,
+    aes(x = component_1, y = component_2, color = Stage)) +
+    geom_point(alpha = 0.8) +
+    ggtitle(label = "UMAP for Cluster 2 cells",
+        subtitle = "Colored by Stage") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Stage")) +
+    stat_ellipse()
+ellipse2_stage
+```
+
+```{r, warning=FALSE}
+meta_2_stages <- compassR::compare_clusters(
+    cell_info = cluster_2,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "Stage",
+    cluster_A = "CHRONIC",
+    cluster_B = "ONSET",
+    for_metareactions = TRUE, # adjusted_p_value_th = 0.1,
+    core_levels_to_plot = "Core Metabolism")
+```
+
+```{r fig2stages, fig.width=15, fig.height=10, fig.cap="Significant reactions by subsystem."}
+cowplot::plot_grid(meta_2_stages$p_DC_reactions, meta_2_stages$p_DC_reactions_cohensd, labels = "auto")
+```
+
+```{r}
+meta_2_stages_results <- get_faceted_results(
+    wilcox_results = meta_2_stages$wilcoxon_results_with_metadata,
+    facets = facets)
+DT::datatable(meta_2_stages_results$faceted_results[, c(
+  "subsystem_priority", "subsystem",
+    "reaction_name", "reaction_id",
+    "cohens_d", "adjusted_p_value")] %>%
+      dplyr::filter(adjusted_p_value < 0.05),
+  filter = "top", extensions = 'Buttons',
+  options = list(dom = 'Blfrtip', buttons = c('copy', 'csv', 'excel'),
+                 lengthMenu = list(c(10,25,50,-1), c(10,25,50,"All"))))
+```
+
+Please, double click on a subsystem priority to highlight its reactions.
+
+```{r figVolcano2stage, fig.cap="Volcano plot for the reactions belonging to significant meta-reactions colored by subsistem of interest.", fig.height=5, fig.width=10}
+meta_2_stages_results$plot
+```
+### Cluster 3
+
+The group A corresponds to Onset cells, and the group B to the Chronic cells.
+
+```{r}
+# subset of cluster 3
+cluster_3 <- subset(x = cell_info_with_dimensionality_reduction, cluster =='3')
+```
+
+```{r figcluster3, fig.cap="Each dot represents a single cell of the Cluster 3, coloured by stage."}
+ellipse3_stage <- ggplot(cluster_3,
+    aes(x = component_1, y = component_2, color = Stage)) +
+    geom_point(alpha = 0.8) +
+    ggtitle(label = "UMAP for Cluster 3 cells",
+        subtitle = "Colored by Stage") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Stage")) +
+    stat_ellipse()
+ellipse3_stage
+```
+
+```{r, warning=FALSE}
+meta_3_stages <- compare_clusters(
+    cell_info = cluster_3,
+    compass_analyzer = compass_analyzer,
+    compass_data = compass_data,
+    variable = "Stage",
+    cluster_A = "CHRONIC",
+    cluster_B = "ONSET",
+    for_metareactions = TRUE, # adjusted_p_value_th = 0.1,
+    core_levels_to_plot = "Core Metabolism")
+```
+
+No differences (very few chronic cells).
+
+### Summary image
+
+```{r figSumStage, fig.cap="Summary of all Chronic vs Onset within cluster comparisons. The signed logarithm of differences between the number of differentially consistent reactions between the two cluster groups is used to color the heatmap. A blueish shade means that the reactions are more consistent on the second group of cells, a redish shade means that the reactions are more consistent on the first group of cells.", fig.width=6, fig.height=12}
+# Collect all tables
+meta_stages <- data.frame(rbind(
+    cbind("Cluster" = "Cluster 1", meta_1_stages_results$faceted_results),
+    cbind("Cluster" = "Cluster 2", meta_2_stages_results$faceted_results)
+)) %>% 
+    select(Cluster, subsystem, reaction_name, reaction_id, 
+        cohens_d, adjusted_p_value) %>%
+    filter(adjusted_p_value <= 0.05) %>%
+    group_by(Cluster, subsystem) %>%
+    summarise(Freqpos = sum(cohens_d > 0),
+              Freqneg = sum(cohens_d < 0)) %>%
+    mutate(Freq = sign(Freqpos - Freqneg)*log1p(abs(Freqpos - Freqneg))) %>%
+    select(-c(Freqpos, Freqneg))
+
+meta_stages_wide <- reshape2::dcast(meta_stages, subsystem ~ Cluster, fill = 0)
+rownames(meta_stages_wide) <- meta_stages_wide$subsystem
+
+# set matrix to plot
+mat <- meta_stages_wide[,2:3]
+paletteLength <- 50
+myColor <- colorRampPalette(
+    rev(RColorBrewer::brewer.pal(n = 7, name = "RdYlBu")))(paletteLength)
+# use floor and ceiling to deal with even/odd length pallettelengths
+my_breaks <- c(seq(min(mat), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq((max(mat) + 1)/paletteLength, (max(mat) + 1), length.out=floor(paletteLength/2)))
+
+pheatmap(mat,
+         color = myColor,
+         scale = "none",
+         cluster_cols = FALSE, 
+         main = "Chronic vs Onset inside cluster \n Summary heatmap",
+         breaks = my_breaks)
+```
+
+```{r stageUMAP12, fig.cap="Each dot represents a single cell coloured by stage. (a) has UMAP for cells of cluster 1, while (b) contains cells of cluster 2. The UMAP components are based on the metareaction consistencies.", fig.width=10, fig.height=5}
+cowplot::plot_grid(ellipse1_stage, ellipse2_stage, nrow = 1, align = "hv", axis = "tblr", labels = "auto")
+```

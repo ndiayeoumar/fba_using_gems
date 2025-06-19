@@ -1,0 +1,694 @@
+---
+title: "Compass data analysis - reactions exploration"
+subtitle: "An example of metabolic profiles anlysis of CD8 cells in Alzheimer"
+author: 
+    - Oumar Ndiaye
+    - Matteo Calgaro
+date: "`r Sys.Date()`"
+output: 
+    bookdown::html_document2:
+        code_folding: hide
+        toc: yes
+        toc_float: true
+        number_section: yes
+        fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+# Introduction
+
+## Compass and Genome-Scale Metabolic Models
+
+Metabolism is a major regulator of immune cell function, but it remains difficult to study the metabolic status of individual cells. This motivated the development of Compass, an algorithm to characterize cellular metabolic states based on single-cell RNA-Seq and flux balance analysis (FBA).
+
+A metabolic flux is the instantaneous rate in which a chemical reaction occurs (*i.e.*, the amount of a metabolite processed by one or more catalytic steps per unit time). Compass belongs to the family of static FBA algorithms, which assumes metabolic steady-state (the state of a metabolic pathway can be expressed as a vector, which denotes the yield of the compounds or the flux in that pathway at a given time. The steady state is a state that remains unchanged over time).
+
+Compass leverages prior knowledge about the metabolic network of the cells in question in the form of a Genome-Scale Metabolic Model (GSMM), which includes the following components:
+
+-   A **stoichiometric matrix** $S$ which describes the set of possible metabolic reactions in the system. Its rows correspond to metabolites, columns to reactions, and entries hold the stoichiometric coefficients of the reactions available to the cells. Reactions for uptake and secretion of a metabolite are encoded as having only a coefficient of 1 and −1 in the metabolite's row entry, respectively, and 0 otherwise.
+
+    -   Reactions are partitioned into cellular *compartments* representing membrane-enclosed space in which a biochemical reaction may take place, for example the cytosol, Golgi, or mitochondria.
+
+    -   Metabolites are represented separately for each compartment. For example, cytosolic citrate and mitochondrial citrate correspond to two rows in $S$*.*
+
+    -   Reactions may contain non-zero coefficients for metabolites located in different compartment to represent physiological transportation of metabolites across membranes. These reactions are called *Transport reactions.*
+
+    -   The extracellular space is represented as an additional compartment.
+
+    -   Reactions may have exactly one non-zero coefficient if the corresponding metabolite is located in the extracellular space. These reactions are called *Exchange reactions* and used to import metabolites into or export them from the system. It is standard convention to assign −1 as the non-zero coefficient of exchange reactions.
+
+-   Upper and lower bounds on fluxes through the reactions corresponding to columns of $S$.
+
+    -   Lower bounds of exchange reactions limit metabolite uptake and used to simulate constraints on nutrient availability. Note these are the lower, and not upper, bounds because the exchange coefficient is −1.
+
+-   A set of genes coding enzymes that catalyze reactions in the network
+
+-   Gene-to-reaction associations:
+
+    -   Every reaction is associated with a boolean expression over gene literals.
+
+    -   Every gene is assigned a truth value based on its presence or absence in the cell's genome. A gene may be absent, for example, in a knockout genotype.
+
+    -   The boolean expressions code the dependency of reactions on their catalysing proteins. Usually, an OR relationship corresponds to isozymes, namely two enzymes capable of catalysing the same reaction, and AND relationship corresponds to enzyme complexes.
+
+## Compass algorithm in brief
+
+Some notation:
+
+-   the set of cells $C$ has a total of $n$ cells (or RNA libraries) and $g$ genes;
+
+-   the set of metabolic reactions in the GSMM, $R$, has a total of $m$ metabolic reactions;
+
+-   $rev(r)$ is the reverse unidirectional reaction of reaction $r$, which has the same stoichiometry of $r$ but proceeds in the opposite direction.
+
+The Compass algorithm can be summarized in few steps:
+
+1.  **Trascriptome-agnostic preparatory step**.\
+    In this step, for a given GSMM (*e.g.,* Recon2), a preparatory step that does not depend on transcriptome data is run and its results are cached for the next steps. The maximal flux $v_r^{opt}$ , where $v\in \mathbb{R}^m$, that every reaction $r$ can carry is computed under some constraints:
+
+    -   the system is in a steady-state $S \cdot v = 0$;
+
+    -   directionality and capacity limits for reactions, including uptake and secretion limits are used $\alpha\le v \le\beta$;
+
+    -   when evaluating the maximum flux for each reaction, its reverse reaction carries no flux $v_{rev(r)}=0$ (to avoid the creation of a futile cycle).
+
+2.  **From gene expression to reaction expression**.\
+    A reaction expression matrix is similar to the gene expression matrix $G_{g \times n}$ but rows represent single metabolic reactions $R_{m\times n}$. This matrix is created by using the boolean gene-to-reaction mapping included in the GSMM.
+
+    -   If a single gene with linear-scale expression $x$ is associated with $r$, the reaction's expression will be $R_{r,j}=\log_{2}(x+1)$.
+
+    -   If no genes are associated with $r$ then $R_{r,j}=0$.
+
+    -   If the reaction is associated with more than one gene, then the reaction's expression will be defined as the sum (ORs) or mean of linear-scale (ANDs).
+
+3.  **Information sharing between single cells (smoothing)**.\
+    To mitigate the sparseness and stochasticity of single-cell measurements, Compass allows for a degree of information-sharing between cells with similar transcriptional profiles. Given a gene expression $G$, we compute k-nearest neighbours (kNN) graph based Euclidean distances in reduced dimension, obtained by taking the top 20 principal components of $G$. The Principal Component Analysis (PCA) is computed over all the genes in $G$, not only metabolic ones:
+
+    -   let $R=r_{i,j}$ and $w_{i,j} = \frac{1}{k}$ if cell $j$ is in the k-nearest-neighbourhood of cell $i$;
+
+    -   then $R^N=r_{i,j}^N$ where $r_{i,j}^N=\sum_{c\in C} w_{j,c}r_{i,c}$
+
+4.  **Main algorithm**.\
+    Compass transforms a gene expression matrix $G_{g\times n}$ into a matrix $C_{m\times n}$ of scores, where rows represent metabolic reactions and the columns are the same RNA libraries as in the gene expression matrix. Each entry represents a proxy for potential reaction activity. More precisely, the entry quantifies the propensity of the cell to use that reaction. Here the steps:
+
+    -   Parameters:
+
+        -   smoothing parameter $\lambda \in [0,1]$ ($\lambda = 0.25$);
+
+        -   nearest neighbour parameter $k$ ($k=10$);
+
+        -   optimality slack parameter $w\in[0,1]$ ($w=0.95$);
+
+        -   penalty function $p(x)$ ($p(x)=\frac{1}{1+x}$)
+
+        -   meta-reaction merging threshold $\rho\in[0,1]$.
+
+    -   Conversion of $G_{g\times n}$ gene expression matrix into $R_{m\times n}$ reaction expression matrix and a neighbourhood reaction expression matrix $R_{m\times n}^N$.
+
+    -   Conversion of $R_{m\times n}$ reaction expression matrix into $P_{m\times n}$ penalty matrix by point-wise inversion $P_{m\times n} = p(R_{m\times n})$. While $R$ represents gene expression support that a reaction is functional in cell, $P$ represents the lack if it. The computation of $R$ and $P$ occurs also for the neighbourhood of each cell for smoothing $P_{m\times n}^N = p(R_{m\times n}^N)$. Finally, $\hat P=(1-\lambda)P+\lambda P^N$.
+
+    -   For each reaction $r\in R$ and $c \in C$ the following steps are computed:
+
+        -   let $\hat P^{(c)}=(\hat P_{1,c},...,\hat P_{m,c})$
+
+        -   $\DeclareMathOperator*{\minimize}{minimize} y_{r,c}:=\mathop{\mathrm{minimize}}_{v \in R^m} \hat P^{(c)}\cdot v$ subject to:
+
+            -   $S\cdot v=0$;
+
+            -   $\alpha \le v \le \beta$;
+
+            -   $v_{rev(r)}=0$
+
+            -   $v_r\ge w\cdot v_r^{opt}$
+
+    -   So, an high penalty $y_{r,c}$ indicates that cell $c$ is unlikely, judged by transcriptomic evidence, to use reaction $r$. For all the reactions and cells, $C^{raw} = [y_{r,c}]_{m\times n}$;
+
+    -   Rows in the $C^{raw}$ matrix that correspond to reactions that are topologically close in the metabolic network can be highly correlated. Hierarchical clustering on Spearman distance of rows, can be used to obtain clusters of meta-reactions which are formed by closely correlated metabolic reactions. This step is data-driven and does not rely on canonical metabolic pathway definitions.
+
+    -   After computing hierarchical clusters over rows of $C^{raw}$, leaves where Spearman similarity ($1-\rho$) is higher than a fixed threshold are averaged together (*e.g.*, $\rho=0.98$).
+
+    -   Meta-reaction scores are computed$C^{meta-raw} = [y_{r,c}^{\prime}]_{m^{\prime \prime}\times n}$ where $m^{\prime \prime} \le m$:
+
+        -   $C^{meta-raw} :=-\log(1+C^{meta-raw})$
+
+        -   $C = C^{meta-raw}-min(C^{meta-raw})$
+
+    -   Constant rows from $C$ are removed. A row is defined as constant if the difference between the largest and smallest score is less than $\epsilon=10^{-3}$.
+
+## Example dataset
+
+In this example, we use the single-cell data from the Alzheimer's Disease mice, brain and meningeal tissues, we focus on the CD8 cells.
+
+# Using COMPASS
+
+The input gene expression matrix can be a tab-delimited text file (tsv) containing normalized and batch-effects-cleaned gene expression estimates (CPM, TPM, or similar scaled units) with one row per gene, one column per sample. Tab-delimited files need row and column labels corresponding to genes and sample names.
+
+To run COMPASS the following command has been used:
+
+```{bash, eval=FALSE}
+Compass [-h] [--data FILE] [--data-mtx FILE [FILE ...]] 
+    [--model MODEL] [--species SPECIES] [--media MEDIA] 
+    [--output-dir DIR] [--temp-dir DIR] [--torque-queue QUEUE] 
+    [--num-processes N] [--lambda F] [--num-threads N] [--and-function FXN]
+    [--select-reactions FILE] [--select-subsystems FILE] [--num-neighbors N] 
+    [--symmetric-kernel] [--input-weights FILE] [--penalty-diffusion MODE] 
+    [--no-reactions] [--calc-metabolites] [--precache] [--input-knn FILE] 
+    [--output-knn FILE] [--latent-space FILE] [--only-penalties] 
+    [--example-inputs] [--microcluster-size C] [--list-genes FILE] 
+    [--list-reactions FILE]
+```
+
+with $\lambda$, smoothing parameter, set to 0.25 and the number of nearest neighbors set to 10, as in the [COMPASS](https://doi.org/10.1016/j.cell.2021.05.045) research article.
+
+```{bash, eval=FALSE}
+compass --data linear_gene_expression_matrix.tsv 
+    --num-processes 20 
+    --species mus_musculus 
+    --lambda 0.25 
+    --num-neighbors 10
+    --output-dir lamda_met_k10
+    --calc-metabolites
+```
+
+The last one is used for the following analyses.
+
+# Post-Processing
+
+As specified earlier, one of the intermediate outputs of COMPASS is a matrix of penalty scores about the reactions expressions. All the steps which bring the matrix of penalty scores, $P_{m\times n}$, to the matrix of reaction consistencies, $C_{m\times n}$, are taken into account in the post-processing steps.
+
+Two similar, almost equivalent, packages are available to manipulate COMPASS outputs and perform this and other statistical analyses. The first in python and the second in R. While the python version is still maintained, the R version is going to be deprecated soon. However, we modified the R package called `compassR` to make it equivalent to his python counterpart.
+
+## Loading some libraries
+
+The modified `compassR` version is in [this repository](https://github.com/mcalgaro93/compassR). To install it the following command can be run:
+
+```{r, eval=FALSE}
+devtools::install_github("mcalgaro93/compassR")
+```
+
+Then, we load some packages for data manipulation and visualization.
+
+```{r, echo=FALSE, message=FALSE, error=FALSE}
+library(compassR)
+# To manipulate data
+library(dplyr)
+library(plyr)
+# To plot/visualize data
+library(ggplot2)
+library(ggalluvial)
+library(plotly)
+library(cowplot)
+library(DT)
+library(forcats)
+library(tidytext)
+```
+
+## Loading data
+
+To perform COMPASS post-processing some settings must be chosen. By setting the class object `compassSettings`, it is possible to define:
+
+-   the metabolic model directory;
+
+-   the genes, metabolites, reactions, and cells metadata;
+
+-   the user data directory;
+
+-   the COMPASS's output with the reaction penalties;
+
+-   the gene expression input matrix;
+
+-   column names for cells and genes;
+
+-   some naming option for the direction of reactions;
+
+-   the minimum range of variation for a reaction to be kept (not variable reactions are removed);
+
+-   the cut height for the hierarchical clustering used to define meta-reactions
+
+```{r}
+user_data_directory <- "../../data/alzheimer/cd8/tpm_counts_normalized"
+settings <- CompassSettings$new(
+    metabolic_model_directory = system.file("extdata", 
+        "RECON2", package = "compassR"),
+    gene_metadata_file = "gene_metadata.csv",
+    metabolite_metadata_file = "metabolite_metadata.csv",
+    reaction_metadata_file = "reaction_metadata.csv",
+    user_data_directory = user_data_directory,
+    cell_metadata_file = "cell_metadata.csv",
+    compass_reaction_scores_file = "reactions.tsv",
+    linear_gene_expression_matrix_file = "linear_gene_expression_matrix.tsv",
+    cell_id_col_name = "cell_id",
+    gene_id_col_name = "MGI.symbol",
+    reaction_direction_separator = "_",
+    reaction_directions = c("pos", "neg"),
+    min_reaction_consistency = 1e-04, # Not used
+    min_reaction_range = 1e-03,
+    cluster_strength = 0.02 # Spearman correlation 0.98
+)
+```
+
+To run the COMPASS post-processing the `CompassData` object must be created. This procedure is quite time expensive. For this reason we create this object once and then we can load it.
+
+```{r}
+if(!file.exists("../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")){
+    compass_data <- CompassData$new(settings = settings)
+    saveRDS(compass_data, 
+        file = "../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")
+} else compass_data <- readRDS("../../data/alzheimer/cd8/alzheimer_cd8_compass_data_mgi.rds")
+```
+
+The `compassData` object contains several informations:
+
+-   the reaction and meta-reaction consistencies;
+
+-   metabolic genes;
+
+-   genes, cells, reactions, and metabolites metadata
+
+```{r}
+compass_data
+
+# Replace 
+compass_data$gene_expression_statistics <- 
+    compass_data$gene_expression_statistics %>%
+        mutate(cell_id = gsub("[.]", "-", x = cell_id))
+```
+
+To proceed with the analysis, a `CompassAnalyzer` object is created. Two functions are natively available:
+
+-   `conduct_wilcoxon_test()` to conduct a wilcoxon test to compare reaction differential consistency between group of cells;
+
+-   `get_umap_components()` to ordinate the cells based on metabolic profiles.
+
+We added a new function which is `get_umap_components()` to compute PCA of consistencies matrix
+
+```{r}
+compass_analyzer <- CompassAnalyzer$new(settings)
+```
+
+## Data exploration
+
+We want to explore the reactions consistencies. But the data set is very large so we need to reduce the dimensionality of our data. We perform two different unsupervised dimensionality reduction methods: **Uniform Manifold Approximation and Projection (UMAP)** and **Principal Component Analysis (PCA)**.
+
+```{r}
+# As cell_id are numbers, they have been preceded by the 'X'
+# character. For this reason, we remove the character.
+# compass_data$gene_expression_statistics$cell_id <- 
+#     compass_data$gene_expression_statistics$cell_id %>% 
+#     gsub(pattern = "X", replacement = "")
+
+# We set a seed for UMAP reproducibility
+# https://bugs.r-project.org/show_bug.cgi?id=17494 explains why "Rejection"
+set.seed(123, "Mersenne-Twister", sample.kind="Rejection")
+# get UMAP components
+umap_components <- compass_analyzer$get_umap_components(
+    compass_data$reaction_consistencies)
+# get PCA components
+pca_components <- compass_analyzer$get_pca_components(
+    compass_data$reaction_consistencies)
+components <- inner_join(
+    x = umap_components, 
+    y = pca_components,
+    by = "cell_id")
+
+# We perform the UMAP and we add metadata informations
+cell_info_with_dimensionality_reduction <-
+    components %>% 
+    mutate(cell_id = gsub(pattern = "[.]", replacement = "-", x = cell_id)) %>%
+    inner_join(
+        compass_data$cell_metadata,
+        by = "cell_id"
+    ) %>%
+    left_join(
+        compass_data$gene_expression_statistics,
+        by = "cell_id"
+    )
+```
+
+### UMAP 
+
+It is a non-linear dimensional reduction method which is very effective for visualizing clusters or groups of data points and their relative proximities.
+
+```{r message=FALSE, error=FALSE}
+# UMAP components are computed as characters. 
+# We convert them in numeric values
+cell_info_with_dimensionality_reduction$component_1 <- 
+    as.numeric(cell_info_with_dimensionality_reduction$component_1)
+cell_info_with_dimensionality_reduction$component_2 <- 
+    as.numeric(cell_info_with_dimensionality_reduction$component_2)
+```
+
+#### Tissue and Condition
+
+In Figure \@ref(fig:rumapbytissuecond) cells are clearly separated by tissue and condition. Each group contains cells of only one tissue and one condition. The first dimension separates tissues, the second, conditions.
+
+```{r rumapbytissuecond, fig.cap="Each dot represents a single cell coloured based on its tissue and condition."}
+p_m_umap_tissue_condition <- ggplot(cell_info_with_dimensionality_reduction, aes(x = component_1, 
+    y = component_2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.5, size = 1) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP colored by tissue (Brain or Meninges) and condition (3xTg or WT)") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    stat_ellipse(aes(lty = paste0(tissue, ", ", condition))) + 
+    guides(color = guide_legend(title = "Tissue and Condition"), 
+           lty = guide_legend(title = "Tissue and Condition"))
+
+p_m_umap_tissue_condition
+```
+
+#### Cell type
+
+In figure \@ref(fig:rumapbycelltype) we can't see groups of cells containing only cells from one single cell type. Thus, the first two UMAP dimensions seem not to separate cells based on the type they belong to.
+
+```{r rumapbycelltype, fig.cap="Each dot represents a single cell coloured based on the type they belong to."}
+p_m_umap_ct <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cell_type)) +
+    geom_point(alpha = 0.8, size = 1) +
+    ggtitle("UMAP colored by cell type") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) + 
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cell type", ncol = 2))
+
+p_m_umap_ct
+```
+
+#### Metabolic activity
+
+On the summary of our `compassData` object we have *gene_expression* table containing the columns `total_expression`, `metabolic_expression`, and `metabolic_activity`. A cell's "total expression" is the extent to which it expresses any of its genes. Its "metabolic expression" is the extent to which it expresses its metabolic genes. And finally, its "metabolic activity" is the ratio of its metabolic expression to its total expression. In Figure \@ref(fig:rumapbymetabolicactivity), cells within the same group present different metabolic activities. Therefore they don't seem to be segregated based on their metabolic activity levels. Also here we see a very narrow range of metabolic activity values, meaning that most of the genes these cells express do not belong to the genome-scale metabolic model RECON2.
+
+```{r rumapbymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_umap_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8, size = 1) +
+    theme(legend.position = "bottom") +
+    ggtitle("UMAP colored by metabolic activity") +
+    xlab(label ="UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_umap_ma
+```
+
+### PCA
+
+It is accomplished by linearly transforming the data into a new coordinate system where (most of) the variation in the data can be described with fewer dimensions than the initial data. Many studies use the first two principal components in order to plot the data in two dimensions and to visually identify clusters of closely related data points.
+
+#### Tissue and Condition
+
+In Figure \@ref(fig:rpcabytissuecondition) groups of cells are clearly separated by tissue and condition. We can say that the first PC separate cells based on their tissue.
+
+```{r rpcabytissuecondition, fig.cap="Each dot represents a single cell coloured based on their tissue and condition."}
+p_m_pca_tissue_condition <- ggplot(cell_info_with_dimensionality_reduction, aes(x = PCA_1, 
+    y = PCA_2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA colored by tissue (Brain or Meninges) and condition (3xTg or WT)") +
+    xlab(label = "PC 1") +
+    ylab(label = "PC 2") +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Tissue and Condition"), 
+           lty = guide_legend(title = "Tissue and Condition"))
+
+p_m_pca_tissue_condition
+```
+
+#### Cell type
+
+In figure \@ref(fig:rpcabycelltype) we can't see group of cells containing only cells of one single type. Thus, the first two PCs don't seem to separate cells based on the type they belong to.
+
+```{r rpcabycelltype, fig.cap="Each dot represents a single cell coloured based on the subset they belong to."}
+p_m_pca_ct <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA colored by cell type") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) + 
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cell type", ncol = 3))
+
+p_m_pca_ct
+```
+
+#### Metabolic activity
+
+In Figure \@ref(fig:rpcabymetabolicactivity), cells within the same group present different metabolic activities. Therefore they don't seem to be segregated based on their metabolic activity levels. However, each group of cells shows a descending metabolic activity gradient going from left to right. 
+
+```{r rpcabymetabolicactivity, fig.cap="Each dot represents a single cell coloured based on their metabolic activity."}
+# umap according to metabolic activity
+p_m_pca_ma <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    theme(legend.position = "bottom") +
+    ggtitle("PCA colored by metabolic activity") +
+    xlab(label ="PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() + 
+    theme(legend.position = "bottom")
+
+p_m_pca_ma
+```
+
+# Cluster analysis
+
+Stage and condition differentiate our cells. A possible way to further disclose the cells' characteristics is to group them in clusters based on the first two dimensions of the UMAP plot. Then, we try to discover what are the characteristics of each cluster.
+
+Firstly, to automatically detect the number of clusters, we will use the function `get_optimal_clusters()` to identify the number of clusters which maximizes the silhouette index.
+
+```{r avgSilPlot, fig.cap="Average silhouette indexes for several number of clusters. The hierarchical clustering algorithm on 'euclidean' distances using the 'average' agglomeration method has been used."}
+opt_cl <- get_optimal_clusters(UMAPcoords = cell_info_with_dimensionality_reduction[, c("component_1", "component_2")], k.values = 5:25, plot = TRUE)
+```
+
+According to the average silhouette values in Figure \@ref(fig:avgSilPlot), the optimal number of clusters is 16. However we decide to work with 11 clusters to keep the cluster numerosity low.
+
+To obtain the cluster membership for each cell, the `function get_cluster()` can be used. The number of cells in each cluster, stratified by cell type, tissue, and condition is summarized in Figure \@ref(fig:plotCellTypeCluster).
+
+```{r clMembership}
+cell_info_with_dimensionality_reduction$cluster <- as.factor(get_cluster(
+    df = cell_info_with_dimensionality_reduction[, c("component_1", "component_2")],
+    k = 11))
+# kableExtra::kable(
+#     x = table(cell_info_with_dimensionality_reduction$cluster), 
+#     caption = "Number of cells for each cluster.",
+#     col.names = c("Cluster", "N Cells"), booktabs = TRUE)
+```
+
+```{r plotCellTypeCluster, fig.cap="Cell types distribution across stages and clusters.", fig.height=8, fig.width=5}
+# Count how many cells for each cluster, stage, cell type
+df_cluster <- plyr::ddply(.data = cell_info_with_dimensionality_reduction, 
+    .variables = ~ cluster + tissue + condition + cell_type, 
+    function(cells) return(data.frame("n" = nrow(cells))))
+
+# Count how many cells for each cluster
+df_cluster_summary <- df_cluster %>% 
+    group_by(cluster) %>%
+    dplyr::summarize(n = sum(n)) %>%
+    arrange(desc(n))
+
+# Order the cluster levels for the summary
+df_cluster_summary$cluster <- factor(df_cluster_summary$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+# Order the cluster levels for the df
+df_cluster$cluster <- factor(df_cluster$cluster, 
+    levels = df_cluster_summary$cluster, 
+    labels = df_cluster_summary$cluster, ordered = TRUE)
+
+# Generate table with the frequencies
+main_plot <- ggplot(data = df_cluster, 
+    aes(x = cluster, y = cell_type)) +
+    # coord_equal() + 
+    geom_tile(aes(fill = cell_type, alpha = n), width = 0.8, height = 0.8) +
+    geom_text(aes(label = n)) + 
+    ggh4x::facet_nested(tissue + condition ~ ., scales = "free", space = "free") +
+    scale_x_discrete(breaks = 1:11) +
+    ylab("Cell type") +
+    scale_fill_manual(guide = "none", values = RColorBrewer::brewer.pal(n = 5, "Set1")) +
+    scale_alpha_continuous(guide = "none")
+
+# Generate a barplot with the total cells in each clusters
+over_strip <- ggplot(data = df_cluster_summary, 
+    aes(x = cluster, y = n, fill = cluster)) +
+    geom_col(aes(alpha = n), width = 0.8) +
+    geom_text(aes(label = n, y = n + 5)) + 
+    scale_x_discrete(breaks = df_cluster_summary$cluster) +
+    scale_alpha_continuous(guide = "none") +
+    theme_void() +
+    scale_fill_manual(values = RColorBrewer::brewer.pal(11, "Set3"), breaks = c(1:11)) +
+    theme(legend.position = "none")
+
+# Combine the two plots
+cowplot::plot_grid(over_strip, main_plot, ncol = 1, axis = "lr", align = "v", rel_heights = c(1,5))
+```
+
+The UMAP representation is visible in Figure \@ref(fig:rUMAPbycluster).
+
+```{r rUMAPbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_umap_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = component_1, y = component_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP colored by cluster") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(11, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_umap_cluster
+```
+
+
+
+```{r rUMAPbyclustertissuecondition, fig.cap="Each dot represents a single cell coloured based on their cluster membership. Cells are faceted by tissue and condition."}
+p_m_umap_cluster + 
+    ggh4x::facet_nested_wrap(tissue ~ condition) + 
+    geom_hline(yintercept = 0, color = "grey") + 
+    geom_vline(xintercept = 0, color = "grey")
+```
+
+The PCA representation is visible in Figure \@ref(fig:rPCAbycluster).
+
+```{r rPCAbycluster, fig.cap="Each dot represents a single cell coloured based on their cluster membership."}
+p_m_pca_cluster <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA_1, y = PCA_2, color = cluster)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA colored by cluster") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(11, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster", nrow = 1))
+p_m_pca_cluster
+```
+
+# Summary
+
+Before moving on with deeper analysis of these clusters, it would be interesting to investigate the UMAP and PCA representations based on the gene expression values with the information about the cluster membership of the cells based on their metabolic profile. In case of systematic patterns, we shall assume that there might be a direct association between gene expression levels and their reactions.
+
+```{r}
+gene_exp_umap_comps <- read.csv(file = "../../data/alzheimer/cd8/PCA_UMAP_coordinates.csv")
+
+# We perform the UMAP and we add metadata informations
+cell_info_with_dimensionality_reduction <-
+    cell_info_with_dimensionality_reduction %>%
+    left_join(
+        gene_exp_umap_comps,
+        by = "cell_id")
+```
+
+## UMAP - Trascriptional profile
+
+In Figure \@ref(fig:geneUMAPRNA)), the cells are UMAP-ordinated by expression levels and colored by the membership we previously calculated using the reaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the reaction consistencies. In the other panels, the tissue and condition (b), cell type (c), and metabolic activity (d) are represented.
+
+```{r geneUMAPRNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_a <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by cluster membership") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(11, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_b <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by tissue and condition") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Tissue and Condition"))
+
+p_c <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by cell type") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+p_d <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = UMAP1, y = UMAP2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("UMAP (based on gene expression) colored by metabolic activity") +
+    xlab(label = "UMAP 1") +
+    ylab(label = "UMAP 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_a, p_b, p_c, p_d, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+
+```
+
+We can clearly see a separation in the UMAP based on cell type (panel c).
+
+## UMAP - Metabolic profile
+
+```{r geneUMAPmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The UMAPs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_umap_cluster, p_m_umap_tissue_condition, p_m_umap_ct, p_m_umap_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+## PCA - Trascriptional profile
+
+In Figure \@ref(fig:genePCARNA)), the cells are PCA-ordinated by expression levels and colored by the membership we previously calculated using the reaction consistencies (panel a). By eye, no patterns seem to be visible regarding the cluster membership based on the reaction consistencies. In the other panels, the tissue and condition (b), cell type (c), and metabolic activity (d) are represented.
+
+```{r genePCARNA, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The PCs are based on the gene expression values.", fig.width=14, fig.height=16}
+p_a <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = as.factor(cluster))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by cluster membership") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(11, "Set3")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(title = "Cluster"))
+
+p_b <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = paste0(tissue, ", ", condition))) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by tissue and condition") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    theme(legend.position = "bottom") + 
+    guides(color = guide_legend(title = "Tissue and Condition"))
+
+p_c <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = cell_type)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by cell type") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_manual(values = RColorBrewer::brewer.pal(5, "Set1")) +
+    theme(legend.position = "bottom") +
+    guides(color = guide_legend(nrow = 2, byrow = TRUE))
+
+p_d <- ggplot(cell_info_with_dimensionality_reduction,
+    aes(x = PCA1, y = PCA2, color = metabolic_activity)) +
+    geom_point(alpha = 0.8) +
+    ggtitle("PCA (based on gene expression) colored by metabolic activity") +
+    xlab(label = "PCA 1") +
+    ylab(label = "PCA 2") +
+    scale_color_viridis_c() +
+    theme(legend.position = "bottom")
+
+cowplot::plot_grid(p_a, p_b, p_c, p_d, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```
+
+Interestingly, we can see a separation in the PCA based on metabolic clusters (panel a), tissue and condition (b), and cell type (panel c).
+
+## PCA - Metabolic profile
+
+```{r genePCAmetabolic, fig.cap="Each dot represents a single cell coloured by cluster membership computed from the reaction consistencies (a), tissue and condition (b), cell type (c), and metabolic activity (d). The PCAs are based on the gene expression values.", fig.width=14, fig.height=16}
+cowplot::plot_grid(p_m_pca_cluster, p_m_pca_tissue_condition, p_m_pca_ct, p_m_pca_ma, nrow = 2, align = "hv", axis = "tblr", labels = "auto")
+```

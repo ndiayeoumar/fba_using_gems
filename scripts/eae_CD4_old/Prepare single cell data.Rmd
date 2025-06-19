@@ -1,0 +1,370 @@
+---
+title: "Preparation of single-cell data"
+subtitle: "Normalization and correction of single-cell data"
+author: 
+    - Matteo Calgaro
+date: "`r Sys.Date()`"
+output: 
+    bookdown::html_document2:
+        toc: yes
+        number_section: yes
+        fig_caption: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+```
+
+```{r}
+# For data handling
+library(SingleCellExperiment)
+# For negative control genes
+library(scMerge)
+library(org.Mm.eg.db)
+# For normalization benchmark
+library(scone)
+# Color palettes
+library(RColorBrewer)
+```
+
+# Introduction
+
+The single-cell object we are using has been analysed following some steps:
+
+-   `cellranger --mkfastq` and `cellranger --count`;
+
+-   the empty droplets have been removed;
+
+-   the transcripts have been mapped to the genome using the Ensembl database v.103 for Mus musculus `musMusculus <- AnnotationHub()[["AH89457"]]`;
+
+-   unknown genes, together with ribosomal, and riken genes have been removed;
+
+-   mitochondrial gene expression, sum of counts, and number of positive genes for each cell have been used to dynamically discard low quality cells;
+
+cell type classification has been performed by using the `SingleR` package on the log-normalized expression values, comparing them to the `ImmGen` reference database. To get log-normalized values, the default scater package pipeline has been used, according to the [OSCA](http://bioconductor.org/books/3.15/OSCA.basic/normalization.html#normalization-by-deconvolution) guidelines:
+
+-   the function `quickCluster()` is used to cluster similar cells based on their expression values;
+
+-   a scaling normalization of single-cell RNA-seq data by deconvolving size factors from cell pools using the `computeSumFactors()` function is performed;
+
+-   the `logNormCounts()` function is used to compute normalized expression values for each cell. This is done by dividing the count for each gene transcript with the appropriate size factor for that cell. The function also log-transforms the normalized values, creating a new assay called "logcounts".
+
+Let's load the data:
+
+```{r}
+sce_object <- readRDS(
+    file = "../../data/eae/QCed_data_with_clusters_EAE_batched.Rds")
+sce_object
+```
+
+We only keep EAE, CD4 cells:
+
+```{r}
+sce_object_eae <- sce_object[, sce_object$condition == "EAE"]
+# Estraggo solo le cellule CD4
+sce_object_eae_cd4 <- sce_object_eae[, grepl(
+    pattern = "[(]T.4|T.CD4", 
+    x = sce_object_eae$pruned_fine)]
+# Filtro i geni che non hanno conte nel sottogruppo cellulare appena creato
+genes2keep <- rowSums(counts(sce_object_eae_cd4)) > 0
+sce <- sce_object_eae_cd4[genes2keep, ]
+sce
+```
+
+# Normalization
+
+## Showing technical variability
+
+One of the quality score is the number of reads for each cell. We can use simple bar plots to visualize how this metric relates to the biological batch.
+
+```{r}
+# Define a color scheme
+cc <- c(brewer.pal(9, "Set1"))
+
+# One batch per Biological Condition
+batch = factor(colData(sce)$stage)
+
+# Quality Metrics
+qc = colData(sce)[, c("sum", "detected", "subsets_Mito_percent")]
+
+# Barplot of the sum of counts for each cell
+sum = qc$sum
+o = order(sum)[order(batch[order(sum)])] # Order by batch, then value
+
+barplot(sum[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Sum of the counts for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+We see that read coverage varies between batches as well as within batches. These coverage differences and other technical features can induce non-intuitive biases upon expression estimates. Though some biases can be addressed with simple library-size normalization and cell-filtering, demand for greater cell numbers may require more sophisticated normalization methods in order to compare multiple batches of cells. Batch-specific biases are impossible to address directly in this study as biological origin and sample preparation are completely confounded.
+
+The same visualization can be used to study the number of detected transcripts for each cell.
+
+```{r}
+# Barplot of the detected transcripts for each cell
+detected = qc$detected
+o = order(detected)[order(batch[order(detected)])] # Order by batch, then value
+
+barplot(detected[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Number of positive counts for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+And the percentage of Mitochondrial reads.
+
+```{r}
+# Barplot of the Mitochondrial percentage for each cell
+subsets_Mito_percent = qc$subsets_Mito_percent
+o = order(subsets_Mito_percent)[order(batch[order(subsets_Mito_percent)])] # Order by batch, then value
+
+barplot(subsets_Mito_percent[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Percentage of Mitochondrial reads for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+## Using Scone
+
+Using `scone` we normalize expression data using a framework for evaluating the performance of normalization workflows. We choose to run scone:
+
+-   on raw counts;
+
+-   selecting stage as the biological variable to preserve;
+
+-   selecting the library size, number of expressed genes per cell, and percentage of mitochondrial reads per cell, as the QC metrics to include into the normalization;
+
+-   using a list of negative control genes for mus musculus as indicated by the `scMerge` package.
+
+```{r}
+# Expression Data (Required)
+expr = as.matrix(assays(sce)$counts)
+
+# Biological Origin - Variation to be preserved (Optional)
+bio = factor(colData(sce)$stage)
+
+# Processed Alignment Metrics - Variation to be removed (Optional)
+qc = colData(sce)[, 
+    c("sum", "detected", "subsets_Mito_percent")]
+
+ppq = scale(qc[, apply(qc, 2, sd) > 0], 
+    center = TRUE, scale = TRUE)
+
+# # Positive Control Genes - Prior knowledge of DE (Optional)
+# poscon = intersect(rownames(expr),
+#     strsplit(paste0(), # Vector of HKGs
+#         split = ", ")[[1]])
+
+# Negative Control Genes - Uniformly expressed transcripts (Optional)
+data(segList_ensemblGeneID, package = 'scMerge')
+nc_ensembl <- segList_ensemblGeneID$mouse$mouse_scSEG
+
+library("org.Mm.eg.db")
+x <- org.Mm.eg.db
+# keytypes(x)
+nc <- select(x, keys = nc_ensembl, columns = c("SYMBOL") , keytype = "ENSEMBL")
+negcon = intersect(rownames(expr), nc[, "SYMBOL"])
+
+# Creating a SconeExperiment Object
+my_scone <- SconeExperiment(
+    expr,
+    qc = ppq, 
+    bio = bio,
+    negcon_ruv = rownames(expr) %in% negcon
+    # poscon = rownames(expr) %in% poscon
+)
+```
+
+Before we can decide which workflows (normalizations) we will want to compare, we will also need to define the types of scaling functions we will consider in the comparison of normalizations.
+
+```{r}
+scaling = list(none = identity, # Identity - do nothing
+     sum = SUM_FN, # SCONE library wrappers...
+     tmm = TMM_FN, 
+     uq = UQ_FN,
+     fq = FQT_FN,
+     psi = PSINORM_FN,
+     deseq = DESEQ_FN)
+```
+
+No zero imputation is included. However, 3 maximum factors of unwanted variation and 3 maximum PCA are estimated for RUV (based on negative control genes) and QC metrics respectively during the adjustment step.
+
+```{r}
+# # Simple FNR model estimation with SCONE::estimate_ziber
+# fnr_out = estimate_ziber(
+#     x = expr, 
+#     bulk_model = FALSE,
+#     maxiter = 10000)
+
+## ----- Imputation List Argument -----
+imputation = list(
+    none = impute_null, # No imputation
+    expect = impute_expectation) # Replace zeroes
+
+# ## ----- Imputation Function Arguments -----
+# # accessible by functions in imputation list argument
+# impute_args = list(p_nodrop = fnr_out$p_nodrop, mu = exp(fnr_out$Alpha[1,]))
+
+my_scone <- scone(
+    my_scone,
+    # imputation = imputation, 
+    # impute_args = impute_args,
+    scaling = scaling,
+    k_qc = 3, k_ruv = 3,
+    adjust_bio = "no",
+    run = FALSE)
+```
+
+So the evaluated methods are:
+
+```{r}
+apply(get_params(my_scone),2,unique)
+```
+
+## Running Scone
+
+Now that we have selected our workflows, we can run `scone` in `run = TRUE` mode. As well as arguments used in `run = FALSE` mode, this mode relies on a few additional arguments. In order to understand these arguments, we must first understand the 8 metrics used to evaluate each normalization. The first 6 metrics rely on a reduction of the normalized data down to 3 dimensions via PCA (default). Each metric is taken to have a positive (higher is better) or negative (lower is better) signature.
+
+-   BIO_SIL: Preservation of Biological Difference. The average silhouette width of clusters defined by `bio`, defined with respect to a Euclidean distance metric over the first 3 expression PCs. Positive signature.
+
+-   BATCH_SIL: Removal of Batch Structure. The average silhouette width of clusters defined by `batch`, defined with respect to a Euclidean distance metric over the first 3 expression PCs. Negative signature.
+
+-   PAM_SIL: Preservation of Single-Cell Heterogeneity. The maximum average silhouette width of clusters defined by PAM clustering, defined with respect to a Euclidean distance metric over the first 3 expression PCs. Positive signature.
+
+-   EXP_QC_COR: Removal of Alignment Artifacts. R\^2 measure for regression of first 3 expression PCs on first `k_qc` QPCs. Negative signature.
+
+-   EXP_UV_COR: Removal of Expression Artifacts. R\^2 measure for regression of first 3 expression PCs on first 3 PCs of the negative control (specified by `eval_negcon` or `ruv_negcon` by default) sub-matrix of the original (raw) data. Negative signature.
+
+-   EXP_WV_COR: Preservation of Biological Variance. R\^2 measure for regression of first 3 expression PCs on first 3 PCs of the positive control (specified by `eval_poscon`) sub-matrix of the original (raw) data. Positive signature.
+
+-   RLE_MED: Reduction of Global Differential Expression. The mean squared-median Relative Log Expression (RLE). Negative signature.
+
+-   RLE_IQR: Reduction of Global Differential Variability. The variance of the inter-quartile range (IQR) of the RLE. Negative signature.
+
+```{r}
+BiocParallel::register(
+  BiocParallel::MulticoreParam(8)
+) # Register BiocParallel Serial Execution
+
+my_scone <- scone(my_scone,
+                  scaling = scaling,
+                  run = TRUE,
+                  eval_kclust = 2:6,
+                  stratified_pam = TRUE,
+                  return_norm = "in_memory",
+                  zero = "postadjust")
+```
+
+In the call above, we have set the following parameter arguments:
+
+-   `eval_kclust = 2:6`. For PAM_SIL, range of k (\# of clusters) to use when computing maximum average silhouette width of PAM clusterings.
+
+-   `stratified_pam = TRUE`. For PAM_SIL, apply separate PAM clusterings to each biological batch rather than across all batches. Average is weighted by batch group size.
+
+-   `return_norm = “in_memory”`. Store all normalized matrices in addition to evaluation data. Otherwise normalized data is not returned in the resulting object.
+
+-   `zero = “postadjust”`. Restore data entries that are originally zeroes / negative after normalization to zero after the adjustment step.
+
+The output will contain various updated elements:
+
+```{r}
+head(get_scores(my_scone))
+```
+
+```{r}
+head(get_score_ranks(my_scone))
+```
+
+`get_scores` returns the 8 raw metrics for each normalization multiplied by their signature - or \"scores.\" `get_score_ranks` returns the mean score rank for each normalization. Both of these are sorted in decreasing order by mean score rank. Finally `get_normalized` returns the normalized expression data for the requested method. If the normalized data isn\'t stored in the object it will be recomputed.
+
+```{r}
+out_norm = get_normalized(my_scone,
+    method = rownames(get_params(my_scone))[1], log = FALSE)
+```
+
+## Selecting a normalization
+
+Based on our sorting criteria, it would appear that `none,sum,qc_k=1,no_bio,no_batch` performs well compared to other normalization workflows. A useful way to visualize this method with respect to others is the `biplot_color` function
+
+```{r}
+pc_obj = prcomp(apply(t(get_scores(my_scone)),1,rank),
+                center = TRUE,scale = FALSE)
+bp_obj = biplot_color(pc_obj,y = -get_score_ranks(my_scone),expand = .6)
+```
+
+Each point above is colored according the corresponding method\'s mean score rank (yellow vs blue \~ good vs bad), and we can see that workflows span a continuum of metric performance. Let\'s visualize the top-performing method and it\'s relation to un-normalized data (\"no-op\" normalization):
+
+```{r}
+bp_obj = biplot_color(pc_obj,y = -get_score_ranks(my_scone),expand = .6)
+
+points(t(bp_obj[1,]), pch = 1, col = "red", cex = 1)
+points(t(bp_obj[1,]), pch = 1, col = "red", cex = 1.5)
+
+points(t(bp_obj[rownames(bp_obj) == "none,none,no_uv,no_bio,no_batch",]),
+       pch = 1, col = "blue", cex = 1)
+points(t(bp_obj[rownames(bp_obj) == "none,none,no_uv,no_bio,no_batch",]),
+       pch = 1, col = "blue", cex = 1.5)
+
+arrows(bp_obj[rownames(bp_obj) == "none,none,no_uv,no_bio,no_batch",][1],
+       bp_obj[rownames(bp_obj) == "none,none,no_uv,no_bio,no_batch",][2],
+       bp_obj[1,][1],
+       bp_obj[1,][2],
+       lty = 2, lwd = 2)
+```
+
+The arrow we\'ve added to the plot traces a line from the \"no-op\" normalization to the top-ranked normalization in SCONE. We see that SCONE has selected a method in-between the two extremes, reducing the signal of unwanted variation while preserving biological signal.
+
+## Showing technical variability after normalization
+
+The three plots proposed earlier, showing the technical variability, are now displayed again on normalized data.
+
+```{r}
+# Quality Metrics
+assays(sce)$counts <- out_norm
+# retrieve mithocondrial genes, that are labelled as "chrM"
+is.mito <- which(rowData(sce)$chrLoc == "MT")
+# compute stats and store them as column data
+library(scater)
+QCmetrics <- perCellQCMetrics(sce, subsets = list(Mito = is.mito))
+
+qc = QCmetrics[, c("sum", "detected", "subsets_Mito_percent")]
+
+# Barplot of the sum of counts for each cell
+sum = qc$sum
+o = order(sum)[order(batch[order(sum)])] # Order by batch, then value
+
+barplot(sum[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Sum of the counts for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+```{r}
+# Barplot of the detected transcripts for each cell
+detected = qc$detected
+o = order(detected)[order(batch[order(detected)])] # Order by batch, then value
+
+barplot(detected[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Number of positive counts for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+```{r}
+# Barplot of the Mitochondrial percentage for each cell
+subsets_Mito_percent = qc$subsets_Mito_percent
+o = order(subsets_Mito_percent)[order(batch[order(subsets_Mito_percent)])] # Order by batch, then value
+
+barplot(subsets_Mito_percent[o], col=cc[batch][o], 
+        border=cc[batch][o], main="Percentage of Mitochondrial reads for each cell")
+legend("bottomleft", legend=levels(batch), fill=cc,cex=0.4)
+```
+
+The biggest difference is visible in the distribution of library sizes which are now more comparable between cells.
+
+# Output
+
+As we have single-cell data from the 10X Genomics Chromium system, we have UMI data and we can compute TPM and CPM interchangeabily as for UMI count data, no division by the effective length should be performed. This is because the number of UMIs is a direct (albeit biased) estimate of the number of transcripts.
+
+```{r}
+TPM <- scuttle::calculateTPM(out_norm)
+write.table(x = cbind("MGI.symbol" = toupper(rownames(TPM)), TPM), 
+    file =  "../../data/eae/tpm_counts_normalized/linear_gene_expression_matrix.tsv", sep = "\t", quote = FALSE, row.names = FALSE)
+```
+

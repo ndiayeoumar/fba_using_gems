@@ -1,0 +1,25 @@
+﻿;Condition;Population
+3xTg_1_TRM_103p;3xTg_AD;Trm CD103+
+3xTg_2_TRM_103p;3xTg_AD;Trm CD103+
+3xTg_3_TRM_103p;3xTg_AD;Trm CD103+
+WT_1_TRM_103p;WT;Trm CD103+
+WT_2_TRM_103p;WT;Trm CD103+
+WT_3_TRM_103p;WT;Trm CD103+
+3xTg_1_TRM_103n;3xTg_AD;Trm CD103-
+3xTg_2_TRM_103n;3xTg_AD;Trm CD103-
+3xTg_3_TRM_103n;3xTg_AD;Trm CD103-
+WT_1_TRM_103n;WT;Trm CD103-
+WT_2_TRM_103n;WT;Trm CD103-
+WT_3_TRM_103n;WT;Trm CD103-
+3xTg_1_Teff;3xTg_AD;Teff
+3xTg_2_Teff;3xTg_AD;Teff
+3xTg_3_Teff;3xTg_AD;Teff
+WT_1_Teff;WT;Teff
+WT_2_Teff;WT;Teff
+WT_3_Teff;WT;Teff
+3xTg_1_Tcm;3xTg_AD;Tcm
+3xTg_2_Tcm;3xTg_AD;Tcm
+3xTg_3_Tcm;3xTg_AD;Tcm
+WT_1_Tcm;WT;Tcm
+WT_2_Tcm;WT;Tcm
+WT_3_Tcm;WT;Tcm
